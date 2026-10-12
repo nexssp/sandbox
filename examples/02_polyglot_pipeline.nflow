@@ -1,0 +1,28 @@
+@description "Chapter 2: Polyglot pipeline piping data between Node.js and Python"
+
+@require github.com/nexssp/sandbox/nexssflow as sb {
+    engine: "inprocess",
+    workspace: ".sandbox_02",
+    enforce_policy: false
+}
+
+@assert: result.passed == true
+
+# Step 1: Node.js generates structured e-commerce transactions
+{
+    command: "node",
+    args: ["generate.js"],
+    files: {
+        "generate.js": "const orders = [{id: 1, amount: 150}, {id: 2, amount: 350}, {id: 3, amount: 500}]; console.log(JSON.stringify(orders));"
+    }
+} -> sb.exec
+
+# Step 2: Extract stdout and feed directly into Python for analytics via STDIN
+-> {
+    command: "python",
+    args: ["analyze.py"],
+    stdin: .stdout,
+    files: {
+        "analyze.py": "import sys, json\norders = json.loads(sys.stdin.read())\ntotal = sum(o['amount'] for o in orders)\navg = total / len(orders)\nprint(json.dumps({'total': total, 'average': avg, 'count': len(orders)}))\n"
+    }
+} -> sb.exec

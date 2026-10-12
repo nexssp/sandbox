@@ -1,0 +1,50 @@
+# Local sandbox workspaces created by examples and tests
+/.sandbox*/
+/.nexss_workspace/
+
+# Binaries & compiled artifacts
+bin/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test artifacts & profiling outputs
+*.test
+*.out
+coverage.txt
+coverage.html
+profile.pprof
+cpu.pprof
+mem.pprof
+
+# IDEs & Editor configurations
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Local Go workspace files (if used locally)
+go.work
+go.work.sum
+
+# Environment variables & local data
+.env
+.env.*
+*.local
+data/
+*.db
+*.sqlite
+
+.nexss/
+coverage_bench.json
+.task

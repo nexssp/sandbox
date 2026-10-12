@@ -1,0 +1,4 @@
+@description "sandbox.exec via mock engine — basic smoke test"
+@require github.com/nexssp/sandbox/nexssflow { engine: "mock", workspace: ".sandbox_smoke", enforce_policy: "false" }
+
+{ command: "go", args: ["test", "./..."] } -> sandbox.exec

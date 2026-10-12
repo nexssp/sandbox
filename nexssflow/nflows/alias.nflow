@@ -1,0 +1,4 @@
+@description "@require ... as <alias> mounts the bundle under the alias namespace"
+@require github.com/nexssp/sandbox/nexssflow as sb { engine: "mock", workspace: ".sandbox_alias", enforce_policy: "false" }
+
+{ command: "gofmt", args: ["main.go"] } -> sb.exec

@@ -1,0 +1,44 @@
+default_install_hook_types:
+  - pre-commit
+  - pre-push
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+
+  - repo: local
+    hooks:
+      - id: lint-nflow
+        name: lint:nflow
+        entry: task lint:nflow
+        language: system
+        pass_filenames: false
+        types: [go]
+
+      - id: golangci-lint
+        name: golangci-lint (new)
+        entry: task lint:new
+        language: system
+        pass_filenames: false
+        types: [go]
+
+      - id: go-test
+        name: go test
+        entry: task test
+        language: system
+        pass_filenames: false
+        types: [go]
+        stages: [pre-commit]
+
+      - id: pre-push
+        name: pre-push (lint new code + short tests, parallel)
+        entry: task pre-push
+        language: system
+        pass_filenames: false
+        types: [go]
+        stages: [pre-push]

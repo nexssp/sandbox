@@ -1,0 +1,19 @@
+@description "Chapter 1: Dynamic file injection and execution in sandbox"
+
+@require github.com/nexssp/sandbox/nexssflow as sb {
+    engine: "inprocess",
+    workspace: ".sandbox_01",
+    enforce_policy: false
+}
+
+@assert: result.passed == true
+@assert: result.stdout == "Calculation Result: 84\n"
+
+# The 'files' map writes files into the engine workspace; with inprocess this is on the host.
+{
+    command: "node",
+    args: ["calc.js"],
+    files: {
+        "calc.js": "const val = 42 * 2; console.log(`Calculation Result: ${val}`);"
+    }
+} -> sb.exec

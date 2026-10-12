@@ -1,0 +1,4 @@
+@description "in-process engine for CI — no docker/podman required"
+@require github.com/nexssp/sandbox/nexssflow { engine: "inprocess", workspace: ".sandbox_ci", enforce_policy: "false" }
+
+{ command: "echo", args: ["hello", "from", "ci"] } -> sandbox.exec

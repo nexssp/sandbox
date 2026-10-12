@@ -1,0 +1,6 @@
+@description "named @sandbox declaration mounts a sandbox.<name> action"
+@require github.com/nexssp/sandbox/nexssflow { engine: "mock", workspace: ".sandbox_named", enforce_policy: "false" }
+
+@sandbox builder { image: "golang:1.26-alpine", memory_mb: 2048, cpus: 2.0 }
+
+{ command: "go", args: ["build", "./..."] } -> sandbox.builder
