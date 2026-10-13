@@ -98,6 +98,8 @@ type ExecutionResult struct {
 type Engine interface {
 	Name() string
 	Run(ctx context.Context, sessionID string, profile Profile, command Command) (ExecutionResult, error)
+	// WriteFile must confine relativePath to the workspace and either install
+	// the complete file or leave an existing destination unchanged.
 	WriteFile(ctx context.Context, sessionID string, profile Profile, relativePath string, content []byte) error
 	ReadFile(ctx context.Context, sessionID string, profile Profile, relativePath string) ([]byte, error)
 	Reset(ctx context.Context, sessionID string) error

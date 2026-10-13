@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/nexssp/kernel/xerr"
+
 	"github.com/nexssp/sandbox"
 )
 
@@ -168,6 +170,21 @@ func TestStaticPolicy_RejectsTraversalInWritePath(t *testing.T) {
 		if err == nil {
 			t.Fatalf("expected rejection of %q", path)
 		}
+	}
+}
+
+func TestStaticPolicyClassifiesErrors(t *testing.T) {
+	t.Parallel()
+
+	policy := sandbox.StaticPolicy{}
+	if got := xerr.KindFrom(policy.ValidateCommand(sandbox.Profile{AllowedExecutables: []string{"go"}}, sandbox.Command{Argv: []string{"rm"}})); got != xerr.KindForbidden {
+		t.Errorf("disallowed executable error kind = %q, want %q", got, xerr.KindForbidden)
+	}
+	if got := xerr.KindFrom(policy.ValidateWrite(sandbox.Profile{}, "../escape", 1)); got != xerr.KindForbidden {
+		t.Errorf("traversal error kind = %q, want %q", got, xerr.KindForbidden)
+	}
+	if got := xerr.KindFrom(policy.ValidateCommand(sandbox.Profile{}, sandbox.Command{})); got != xerr.KindBadRequest {
+		t.Errorf("empty argv error kind = %q, want %q", got, xerr.KindBadRequest)
 	}
 }
 

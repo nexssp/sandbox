@@ -110,7 +110,9 @@ func TestRunAndMergePolicyPreflightPrecedesEngineIO(t *testing.T) {
 
 		_, err := runAndMerge(context.Background(), engine, sandbox.StaticPolicy{}, strictTestProfile(), map[string]any{
 			"command": "rm",
-			"files":   map[string]string{"hello.txt": "hello"},
+			"files": map[string]any{
+				"hello.txt": map[string]any{"Provider": "test", "ID": "blob"},
+			},
 		})
 		if err == nil || !strings.Contains(err.Error(), "not on the profile allowlist") {
 			t.Fatalf("error = %v, want command-allowlist error", err)
@@ -124,11 +126,11 @@ func TestRunAndMergePolicyPreflightPrecedesEngineIO(t *testing.T) {
 		t.Parallel()
 		engine := &noIOEngine{}
 
-		_, err := runAndMerge(context.Background(), engine, sandbox.StaticPolicy{}, strictTestProfile(), map[string]any{
+		_, err := runAndMergeWithFileResolver(scopedFileContext(), engine, sandbox.StaticPolicy{}, strictTestProfile(), &testFileResolver{}, map[string]any{
 			"command": "go",
-			"files": map[string]string{
-				"valid.txt": "valid",
-				"../escape": "invalid",
+			"files": map[string]any{
+				"valid.txt": map[string]any{"Provider": "test", "ID": "good"},
+				"../escape": map[string]any{"Provider": "test", "ID": "bad"},
 			},
 		})
 		if err == nil || !strings.Contains(err.Error(), "escapes the workspace") {

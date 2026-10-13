@@ -3,11 +3,12 @@ package nexssflow
 import (
 	"github.com/nexssp/flow/compiler"
 	"github.com/nexssp/kernel/action"
+	"github.com/nexssp/kernel/xfile"
 
 	"github.com/nexssp/sandbox"
 )
 
-func materialize(engine sandbox.Engine, policy sandbox.Policy) func(req compiler.MaterializeReq) error {
+func materialize(engine sandbox.Engine, policy sandbox.Policy, resolver xfile.Resolver) func(req compiler.MaterializeReq) error {
 	return func(req compiler.MaterializeReq) error {
 		decls := SandboxDeclarationsFromMeta(req.Meta)
 		if len(decls) == 0 {
@@ -19,7 +20,7 @@ func materialize(engine sandbox.Engine, policy sandbox.Policy) func(req compiler
 			decl := decls[i]
 			profile := declToProfile(decl)
 			profile.ApplyDefaults()
-			actions = append(actions, buildNamedExec(engine, policy, profile))
+			actions = append(actions, buildNamedExec(engine, policy, profile, resolver))
 		}
 
 		return req.Resolver.MountWithAlias(action.Library{

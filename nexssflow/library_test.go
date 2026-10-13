@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/nexssp/flow/compiler"
+	"github.com/nexssp/flow/native"
+	"github.com/nexssp/flow/runner"
 )
 
 func TestBundle_MockEngine(t *testing.T) {
@@ -29,6 +31,49 @@ func TestBundle_MockEngine(t *testing.T) {
 	}
 	if bundle.SelfTest == nil {
 		t.Fatal("selftest hook is nil")
+	}
+}
+
+func TestBundle_RegistersExampleCapabilities(t *testing.T) {
+	t.Parallel()
+
+	bundles := append(native.Bundles(), Bundle(map[string]string{
+		"engine":         "mock",
+		"enforce_policy": "false",
+	}))
+	cfg, err := runner.BuildConfig(bundles)
+	if err != nil {
+		t.Fatalf("build canonical Flow config: %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		source     string
+		capability string
+	}{
+		{
+			name:       "sandbox.exec",
+			capability: "sandbox.exec",
+			source:     `{ command: "echo", args: ["hello"] } -> sandbox.exec`,
+		},
+		{
+			name:       "sandbox.builder",
+			capability: "sandbox.builder",
+			source: `@sandbox builder { image: "golang:1.26-alpine" }
+
+{ command: "go", args: ["build", "./..."] } -> sandbox.builder`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			compiled, err := runner.Compile(t.Context(), cfg, tt.source, tt.name+".nflow")
+			if err != nil {
+				t.Fatalf("compile through canonical Sandbox bundle: %v", err)
+			}
+			if _, ok := compiled.Resolver.Action(tt.capability); !ok {
+				t.Fatalf("capability %q not registered by canonical Sandbox bootstrap", tt.capability)
+			}
+		})
 	}
 }
 

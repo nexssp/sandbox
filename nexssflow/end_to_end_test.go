@@ -2,13 +2,22 @@ package nexssflow_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io"
 	"strings"
 	"testing"
+	"testing/fstest"
 
 	"github.com/nexssp/flow/compiler"
+	embedext "github.com/nexssp/flow/extensions/embed"
 	"github.com/nexssp/flow/extensions/require"
 	"github.com/nexssp/flow/native"
 	"github.com/nexssp/flow/runner"
+	"github.com/nexssp/kernel/xctx"
+	"github.com/nexssp/kernel/xerr"
+	"github.com/nexssp/kernel/xfile"
 )
 
 // TestSandboxBundle_EndToEnd_MockEngine wires up the full Flow
@@ -171,10 +180,9 @@ func TestSandboxBundle_EndToEnd_InProcessEngine(t *testing.T) {
 	}
 }
 
-// TestSandboxBundle_EndToEnd_NamedSandboxWithFiles verifies the
-// sandbox.exec action accepts inline files and writes them into the
-// workspace before running the command.
-func TestSandboxBundle_EndToEnd_NamedSandboxWithFiles(t *testing.T) {
+// TestSandboxBundle_EndToEnd_RequiresExplicitFileResolver verifies that
+// the registry-provided bundle does not resolve external refs implicitly.
+func TestSandboxBundle_EndToEnd_RequiresExplicitFileResolver(t *testing.T) {
 	t.Parallel()
 
 	src := `@require github.com/nexssp/sandbox/nexssflow { engine: "mock", workspace: ".sandbox_e2e_files", enforce_policy: "false" }
@@ -184,24 +192,93 @@ func TestSandboxBundle_EndToEnd_NamedSandboxWithFiles(t *testing.T) {
 {
   command: "cat",
   args: ["hello.txt"],
-  files: { "hello.txt": "hello from file" }
+  files: { "hello.txt": { Provider: "test-store", ID: "hello" } }
 } -> sandbox.runner
 `
 
 	cfg := buildConfig(t, src)
 	ctx := context.Background()
 
-	ex, err := runner.Execute(ctx, cfg, src, "e2e_files.nflow", map[string]any{})
+	_, err := runner.Execute(ctx, cfg, src, "e2e_files.nflow", map[string]any{})
+	if kind := xerr.KindFrom(err); kind != xerr.KindUnavailable {
+		t.Fatalf("error kind = %q, want %q (err %v)", kind, xerr.KindUnavailable, err)
+	}
+}
+
+func TestSandboxBundle_EndToEnd_StagesStaticEmbedAndStorageRef(t *testing.T) {
+	staticPayload := []byte("static embedded payload\n")
+	storagePayload := []byte("storage blob payload\n")
+	storageSum := sha256.Sum256(storagePayload)
+	storageDigest := "sha256:" + hex.EncodeToString(storageSum[:])
+
+	embedBundle, embedResolver := embedext.BundleWithFileResolver(fstest.MapFS{
+		"assets/logo.txt": &fstest.MapFile{Data: staticPayload},
+	}, "flow.static", 1024)
+	if embedResolver == nil {
+		t.Fatal("embed.BundleWithFileResolver returned a nil resolver")
+	}
+
+	storageRef := xfile.Ref{
+		Provider:       "test.storage",
+		ID:             "opaque-storage-id",
+		Version:        "v1",
+		ExpectedSize:   xfile.ExpectedSize(len(storagePayload)),
+		ExpectedDigest: xfile.ExpectedDigest(storageDigest),
+	}
+	storageCalls := 0
+	storageResolver := storageResolverFunc(func(_ context.Context, ref xfile.Ref) (io.ReadCloser, xfile.Info, error) {
+		storageCalls++
+		if ref != storageRef {
+			return nil, xfile.Info{}, fmt.Errorf("storage ref = %#v, want %#v", ref, storageRef)
+		}
+		return io.NopCloser(strings.NewReader(string(storagePayload))), xfile.Info{
+			Provider: ref.Provider,
+			ID:       ref.ID,
+			Version:  ref.Version,
+			Size:     int64(len(storagePayload)),
+			Digest:   storageDigest,
+		}, nil
+	})
+	storageBundle := compiler.BundleWithFileResolver(compiler.Bundle{ID: "e2e-storage"}, storageRef.Provider, storageResolver)
+
+	src := fmt.Sprintf(`@require github.com/nexssp/sandbox/nexssflow as sb { engine: "inprocess", workspace: %q, enforce_policy: "false" }
+@embed logo "assets/logo.txt"
+
+sb.exec @{
+  command: "cat",
+  args: ["static", "storage"],
+  files: {
+    static: embed.logo,
+    storage: {
+      Provider: %q,
+      ID: %q,
+      Version: %q,
+      ExpectedSize: %d,
+      ExpectedDigest: %q
+    }
+  }
+}
+`, t.TempDir(), storageRef.Provider, storageRef.ID, storageRef.Version, storageRef.ExpectedSize, storageRef.ExpectedDigest)
+	cfg := buildConfig(t, src, embedBundle, storageBundle)
+	ctx := xctx.WithUserID(t.Context(), "e2e-caller")
+	ctx = xctx.WithTenantID(ctx, "e2e-tenant")
+	result, err := runner.Execute(ctx, cfg, src, "static_storage.nflow", nil)
 	if err != nil {
-		t.Fatalf("execute: %v", err)
+		t.Fatalf("execute combined static embed and Storage staging: %v", err)
 	}
-	out, ok := ex.Output.(map[string]any)
+	output, ok := result.Output.(map[string]any)
 	if !ok {
-		t.Fatalf("output type = %T", ex.Output)
+		t.Fatalf("output type = %T, want map[string]any", result.Output)
 	}
-	stdout, _ := out["stdout"].(string)
-	if !strings.Contains(stdout, "hello from file") {
-		t.Fatalf("stdout = %q, want 'hello from file'", stdout)
+	if exitCode, _ := output["exit_code"].(int); exitCode != 0 {
+		t.Fatalf("exit_code = %v, want 0; stderr=%q; full output=%#v", output["exit_code"], output["stderr"], output)
+	}
+	wantStdout := string(staticPayload) + string(storagePayload)
+	if stdout, _ := output["stdout"].(string); stdout != wantStdout {
+		t.Fatalf("stdout = %q, want both staged file payloads %q", stdout, wantStdout)
+	}
+	if storageCalls != 1 {
+		t.Fatalf("Storage resolver calls = %d, want 1", storageCalls)
 	}
 }
 
@@ -210,14 +287,14 @@ func TestSandboxBundle_EndToEnd_NamedSandboxWithFiles(t *testing.T) {
 // includes the sandbox bundle's directives and libraries alongside
 // every native Flow bundle (so projection, runtime, modifiers, etc.
 // are all available).
-func buildConfig(t *testing.T, src string) runner.Config {
+func buildConfig(t *testing.T, src string, extraBundles ...compiler.Bundle) runner.Config {
 	t.Helper()
 	ctx := context.Background()
 
 	// Start from the native bundles so all standard extensions
 	// (projection for `{}`, runtime for `noop`/`debug`, modifiers,
 	// directives, etc.) are present.
-	allBundles := native.Bundles()
+	allBundles := append(native.Bundles(), extraBundles...)
 
 	// Run preprocess with the full directive table to collect
 	// @require declarations.
@@ -249,4 +326,10 @@ func buildConfig(t *testing.T, src string) runner.Config {
 		t.Fatalf("build config: %v", err)
 	}
 	return cfg
+}
+
+type storageResolverFunc func(context.Context, xfile.Ref) (io.ReadCloser, xfile.Info, error)
+
+func (resolver storageResolverFunc) Open(ctx context.Context, ref xfile.Ref) (io.ReadCloser, xfile.Info, error) {
+	return resolver(ctx, ref)
 }

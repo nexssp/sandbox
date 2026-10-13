@@ -107,6 +107,22 @@ result, err := engine.Run(ctx, "session-1", profile, cmd)
 // result.ExitCode, result.Stdout, result.Stderr, result.Duration
 ```
 
+## Storage-backed file references
+
+Flow `sandbox.exec` accepts `files` as `map[string]nexssflow.BlobRef` (an alias of `kernel/xfile.Ref`), not inline file contents. Each map key is a workspace-relative destination; each value is an opaque provider reference. The `Provider` and `ID` fields are never interpreted as a local path.
+
+File references remain fail-closed unless a resolver is explicitly configured. A host may inject one directly with `nexssflow.BundleWithFileResolver`; with Flow v0.28.1, provider-scoped resolvers registered by other bundles are composed by `runner.BuildConfig` and exposed through the action context, so the Sandbox bundle can use the combined filesystem and Storage resolver without a custom multiplexer.
+
+```go
+bundle := nexssflow.BundleWithFileResolver(flowOptions, resolver)
+```
+
+The resolver receives the action context. Sandbox checks authenticated caller and tenant scope with `xfile.ScopeFromContext` before opening a reference, then verifies the returned provider/object identity, optional version and expected size, the actual byte count, and the `sha256:<hex>` digest. It streams through a bounded buffer into a private temporary file, removes partial data on cancellation or error, and only then installs the verified file through a confined, atomic workspace write. `MaxFileBytes` is enforced on each resolved file. The normal registry factory (`Bundle`) has no resolver and returns `Unavailable` if a request contains file refs; there is no implicit storage-provider lookup.
+
+Examples 06–07 show host-supplied provider references. Static `@embed` plus Storage staging through `sandbox.exec` is covered by `TestSandboxBundle_EndToEnd_StagesStaticEmbedAndStorageRef` in [`nexssflow/end_to_end_test.go`](nexssflow/end_to_end_test.go).
+
+**Flow v0.28.1 static embed + Storage integration is verified.** The published `extensions/embed` bundle creates typed `xfile.Ref` values from a declared `fs.FS` and registers an FS-backed resolver. `runner.BuildConfig` composes it with provider-scoped Storage resolvers and exposes the composite through the action context; the Sandbox adapter uses that context resolver when no direct resolver was injected. The end-to-end test executes `@embed logo`, passes the resulting static ref and a Storage BlobRef through `sandbox.exec`, and checks both staged payloads. Storage is represented by a deterministic test resolver; this does not exercise a production Storage service or a real container runtime.
+
 ## Policy
 
 `StaticPolicy` is the default. It rejects:
@@ -130,7 +146,7 @@ CI environments where the caller has already vetted the inputs.
 The `@require` option `enforce_policy: "false"` switches the bundle to
 `PermissivePolicy`. The default is `"true"`.
 
-> **Enforcement boundary:** `StaticPolicy` validates requests; it is not an OS security boundary, and direct callers must invoke the policy checks themselves. The host-side `ReadFile`/`WriteFile` methods now use `WorkspaceFS` backed by Go's `os.Root`, rejecting lexical and symlink escapes and enforcing `MaxFileBytes`; this confines file operations but does not isolate command execution. `inprocess` runs commands directly on the host and must only be used with trusted commands. The Flow `sandbox.exec` action applies `MaxWallTime` to every run and caps a caller-supplied timeout at that profile limit. Docker `Engine.Run` bounds captured stdout and stderr independently by `MaxOutputBytes`; environment keys are checked against `AllowedEnvKeys`. Those controls do not cover Docker `ExecAdvanced` or Podman's output capture. Docker and Podman mount the host workspace read-write; both reuse a long-lived container, ignore per-profile resource-update failures, and do not switch the container image for each named profile. Runtime-backed isolation was not verified here, so do not treat Docker or Podman as hardened for untrusted workloads until the remaining gaps are closed and tested against real runtimes.
+> **Enforcement boundary:** `StaticPolicy` validates requests; it is not an OS security boundary, and direct callers must invoke the policy checks themselves. The host-side `ReadFile`/`WriteFile` methods use `WorkspaceFS` backed by Go's `os.Root`, rejecting lexical and symlink escapes and enforcing `MaxFileBytes`; writes are installed atomically from a temporary file within the workspace. This confines file operations but does not isolate command execution. `inprocess` runs commands directly on the host and must only be used with trusted commands. The Flow `sandbox.exec` action applies `MaxWallTime` to every run and caps a caller-supplied timeout at that profile limit. Docker `Engine.Run` bounds captured stdout and stderr independently by `MaxOutputBytes`; environment keys are checked against `AllowedEnvKeys`. Those controls do not cover Docker `ExecAdvanced` or Podman's output capture. Docker and Podman mount the host workspace read-write; both reuse a long-lived container, ignore per-profile resource-update failures, and do not switch the container image for each named profile. Runtime-backed isolation was not verified here, so do not treat Docker or Podman as hardened for untrusted workloads until the remaining gaps are closed and tested against real runtimes.
 
 ## Profile defaults
 
@@ -175,7 +191,7 @@ A2A-worker engines that need cross-engine introspection.
 
 ## Flow showcase
 
-The five Flow integration examples are in [`examples/flow_sandbox`](examples/flow_sandbox/README.md). They are examples of Flow integration, not a security boundary; review their selected engine before running them. The sandbox module's `go.mod` pins Flow v0.20.3 and Kernel v0.27.4, and the standalone `go test ./...` suite is verified against those published module versions as well as the paired current working copies.
+The Flow integration examples are in [`examples`](examples/README.md). Examples 01–05 demonstrate command workflows; examples 06–07 demonstrate host-supplied BlobRefs. The module pins Flow v0.28.1 and Kernel v0.32.0.
 
 Some examples select `inprocess`, which executes commands on the host. Use that backend only for trusted demonstrations; it does not isolate model-generated or other untrusted code. Docker and Podman remain unverified against a real container runtime for this review; see the enforcement boundary above.
 
@@ -185,4 +201,4 @@ Some examples select `inprocess`, which executes commands on the host. Use that 
 go test ./...
 ```
 
-The unit and end-to-end tests use fake or harmless local fixtures; they do not require a live model or container daemon. Run this command from the module root with Go versions compatible with the `go.mod` directive. A passing test suite does not verify Docker or Podman isolation.
+The unit and end-to-end tests use fake or harmless local fixtures; they do not require a live model or container daemon. Run this command from the module root with Go 1.26.9 or later. A passing test suite does not verify Docker or Podman isolation.

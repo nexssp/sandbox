@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/nexssp/kernel/xerr"
 )
 
 type CacheEntry struct {
@@ -44,7 +46,7 @@ type CacheManager struct {
 
 func NewCacheManager(dir string, maxBytes int64, enabled bool) (*CacheManager, error) {
 	if dir == "" {
-		return nil, errors.New("cache: dir is required")
+		return nil, xerr.BadRequest("cache: dir is required")
 	}
 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -171,7 +173,7 @@ func (cm *CacheManager) CommitAndSave(
 	containerName, key, tool, recipe string,
 ) (CacheEntry, error) {
 	if !cm.Enabled() {
-		return CacheEntry{}, errors.New("cache disabled")
+		return CacheEntry{}, xerr.Unavailable("cache disabled")
 	}
 
 	imageTag := "jumalu-cache:" + key
@@ -286,7 +288,7 @@ func (cm *CacheManager) CommitAndSave(
 func (cm *CacheManager) LoadFromDisk(ctx context.Context, key string) (string, error) {
 	entry, ok := cm.Get(key)
 	if !ok {
-		return "", fmt.Errorf("cache entry not found: %s", key)
+		return "", xerr.NotFound("cache entry not found: " + key)
 	}
 
 	if err := runDockerCmd(ctx, "image", "inspect", entry.ImageTag); err == nil {
@@ -334,7 +336,7 @@ func (cm *CacheManager) Delete(ctx context.Context, key string) error {
 	if !ok {
 		cm.mu.Unlock()
 
-		return fmt.Errorf("cache entry not found: %s", key)
+		return xerr.NotFound("cache entry not found: " + key)
 	}
 
 	delete(cm.entries, key)

@@ -1,7 +1,6 @@
 default_install_hook_types:
   - pre-commit
   - pre-push
-
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
@@ -13,32 +12,16 @@ repos:
 
   - repo: local
     hooks:
-      - id: lint-nflow
-        name: lint:nflow
-        entry: task lint:nflow
+      - id: task-pre-commit
+        name: task pre-commit
+        entry: task pre-commit
         language: system
         pass_filenames: false
-        types: [go]
-
-      - id: golangci-lint
-        name: golangci-lint (new)
-        entry: task lint:new
-        language: system
-        pass_filenames: false
-        types: [go]
-
-      - id: go-test
-        name: go test
-        entry: task test
-        language: system
-        pass_filenames: false
-        types: [go]
         stages: [pre-commit]
 
-      - id: pre-push
-        name: pre-push (lint new code + short tests, parallel)
+      - id: task-pre-push
+        name: task pre-push
         entry: task pre-push
         language: system
         pass_filenames: false
-        types: [go]
         stages: [pre-push]

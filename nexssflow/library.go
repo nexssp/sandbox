@@ -5,6 +5,7 @@ import (
 
 	"github.com/nexssp/flow/compiler"
 	"github.com/nexssp/kernel/action"
+	"github.com/nexssp/kernel/xfile"
 
 	"github.com/nexssp/sandbox"
 	"github.com/nexssp/sandbox/docker"
@@ -37,16 +38,28 @@ type GlobalOptions struct {
 	EnforcePolicy bool `nflow:"enforce_policy" default:"true"`
 }
 
+// BlobRef is the Flow-facing name for a provider-neutral xfile.Ref.
+type BlobRef = xfile.Ref
+
 type RunReq struct {
-	Command string            `json:"command" validate:"required"`
-	Args    []string          `json:"args,omitempty"`
-	Env     []string          `json:"env,omitempty"`
-	Stdin   string            `json:"stdin,omitempty"`
-	Files   map[string]string `json:"files,omitempty"`
-	Timeout int               `json:"timeout_seconds,omitempty"`
+	Command string             `json:"command" validate:"required"`
+	Args    []string           `json:"args,omitempty"`
+	Env     []string           `json:"env,omitempty"`
+	Stdin   string             `json:"stdin,omitempty"`
+	Files   map[string]BlobRef `json:"files,omitempty"`
+	Timeout int                `json:"timeout_seconds,omitempty"`
 }
 
+// Bundle builds the standard Sandbox Flow bundle. File references remain
+// disabled unless a resolver is explicitly supplied through BundleWithFileResolver.
 func Bundle(raw map[string]string) compiler.Bundle {
+	return BundleWithFileResolver(raw, nil)
+}
+
+// BundleWithFileResolver builds a Sandbox Flow bundle whose file references
+// are resolved by the explicitly supplied provider. The resolver receives the
+// request context so it can authorize using kernel/xctx scope.
+func BundleWithFileResolver(raw map[string]string, resolver xfile.Resolver) compiler.Bundle {
 	global, err := compiler.Decode[GlobalOptions](raw)
 	if err != nil {
 		panic("sandbox bundle: " + err.Error())
@@ -62,7 +75,7 @@ func Bundle(raw map[string]string) compiler.Bundle {
 		policy = sandbox.PermissivePolicy{}
 	}
 
-	execAction := buildGenericExec(engine, policy, global)
+	execAction := buildGenericExec(engine, policy, global, resolver)
 
 	lib := action.Library{
 		Name:        ID,
@@ -74,7 +87,7 @@ func Bundle(raw map[string]string) compiler.Bundle {
 		ID:          ID,
 		Libraries:   []action.Library{lib},
 		Directives:  []compiler.Directive{newSandboxDirective()},
-		Materialize: materialize(engine, policy),
+		Materialize: materialize(engine, policy, resolver),
 		SelfTest:    selftest,
 		Fixtures:    fixturesFS,
 	}

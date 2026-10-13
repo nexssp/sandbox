@@ -1,6 +1,9 @@
 package sandbox
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -32,7 +35,9 @@ func OpenWorkspaceFS(directory string, maxBytes int) (*WorkspaceFS, error) {
 	return &WorkspaceFS{root: root, maxBytes: int64(maxBytes)}, nil
 }
 
-func (w *WorkspaceFS) WriteFile(relativePath string, content []byte) error {
+// WriteFile atomically replaces a confined workspace file. A failed write
+// leaves an existing destination untouched and removes the temporary file.
+func (w *WorkspaceFS) WriteFile(relativePath string, content []byte) (resultErr error) {
 	if w == nil || w.root == nil {
 		return xerr.Internal("sandbox: workspace filesystem is closed")
 	}
@@ -46,27 +51,62 @@ func (w *WorkspaceFS) WriteFile(relativePath string, content []byte) error {
 		return err
 	}
 
-	if mkErr := w.root.MkdirAll(path.Dir(clean), 0o700); mkErr != nil {
+	parent := path.Dir(clean)
+	if mkErr := w.root.MkdirAll(parent, 0o700); mkErr != nil {
 		return xerr.Internal("sandbox: create workspace directory", mkErr)
 	}
 
-	file, openErr := w.root.OpenFile(clean, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	tempPath, err := workspaceTempName(clean)
+	if err != nil {
+		return xerr.Internal("sandbox: generate workspace temporary file name", err)
+	}
+	file, openErr := w.root.OpenFile(tempPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if openErr != nil {
-		return xerr.Internal("sandbox: open workspace file", openErr)
+		return xerr.Internal("sandbox: create workspace temporary file", openErr)
 	}
+	installed := false
+	fileClosed := false
+	defer func() {
+		if !installed {
+			if !fileClosed {
+				if closeErr := file.Close(); closeErr != nil {
+					resultErr = errors.Join(resultErr, xerr.Internal("sandbox: close incomplete workspace file", closeErr))
+				}
+			}
+			if removeErr := w.root.Remove(tempPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				resultErr = errors.Join(resultErr, xerr.Internal("sandbox: remove incomplete workspace file", removeErr))
+			}
+		}
+	}()
 
-	_, writeErr := file.Write(content)
-	closeErr := file.Close()
-
+	written, writeErr := file.Write(content)
 	if writeErr != nil {
-		return xerr.Internal("sandbox: write workspace file", writeErr)
+		return xerr.Internal("sandbox: write workspace temporary file", writeErr)
 	}
-
-	if closeErr != nil {
-		return xerr.Internal("sandbox: close workspace file", closeErr)
+	if written != len(content) {
+		return xerr.Internal("sandbox: write workspace temporary file", io.ErrShortWrite)
 	}
-
+	if syncErr := file.Sync(); syncErr != nil {
+		return xerr.Internal("sandbox: sync workspace temporary file", syncErr)
+	}
+	if closeErr := file.Close(); closeErr != nil {
+		fileClosed = true
+		return xerr.Internal("sandbox: close workspace temporary file", closeErr)
+	}
+	fileClosed = true
+	if renameErr := w.root.Rename(tempPath, clean); renameErr != nil {
+		return xerr.Internal("sandbox: atomically install workspace file", renameErr)
+	}
+	installed = true
 	return nil
+}
+
+func workspaceTempName(clean string) (string, error) {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", err
+	}
+	return path.Join(path.Dir(clean), "."+path.Base(clean)+"."+hex.EncodeToString(nonce[:])+".tmp"), nil
 }
 
 func (w *WorkspaceFS) ReadFile(relativePath string) ([]byte, error) {
