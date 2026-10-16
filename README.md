@@ -1,204 +1,244 @@
-# nexss-sandbox
+# Nexss Sandbox
 
-A command-execution library with pluggable runtimes; isolation guarantees depend on the selected backend.
-The same `sandbox.Engine` interface is implemented by four backends:
+<small>Nexss Flow 🌀 ready</small>
 
-| Engine     | Use case                                                        |
-| ---------- | --------------------------------------------------------------- |
-| `docker`   | Docker-backed container execution; current adapter caveats apply. |
-| `podman`   | Rootless Podman-backed execution; current adapter caveats apply. |
-| `inprocess`| Trusted tests only; runs commands directly on the host.       |
-| `mock`     | Pure-Go fake for tests; recognises `ls`, `cat`, `go`, `gofmt`. |
+<!-- project-status -->
 
-The sandbox is exposed to [Nexss Flow](https://pkg.go.dev/github.com/nexssp/flow) via the
-`nexssflow` subpackage: a `.nflow` file pulls the sandbox in with a
-single `@require` line and gets a `sandbox.exec` action plus the
-`@sandbox NAME { ... }` directive for declaring named, pre-profiled
-sandboxes.
+[![CI](https://github.com/nexssp/sandbox/actions/workflows/ci.yml/badge.svg)](https://github.com/nexssp/sandbox/actions/workflows/ci.yml)
+[![Latest tag](https://img.shields.io/github/v/tag/nexssp/sandbox?sort=semver&label=latest%20tag)](https://github.com/nexssp/sandbox/tags)
+[![Go Reference](https://pkg.go.dev/badge/github.com/nexssp/sandbox.svg)](https://pkg.go.dev/github.com/nexssp/sandbox)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-## Layout
+<!-- /project-status -->
+
+Nexss Sandbox provides a Go `sandbox.Engine` contract for command execution, workspace file access, and reset/close lifecycle. Docker, Podman, in-process, and mock engines implement the same interface; their isolation properties differ.
+
+> **Important:** `StaticPolicy` validates profiles, commands, environment keys, and file writes; it is not an operating-system security boundary. The `inprocess` engine executes commands directly on the host and is for trusted use only. The Docker and Podman adapters have known enforcement gaps and have not been verified against a real runtime here. Do not treat this package as hardened isolation for untrusted code.
+
+## Architecture
 
 ```
-sandbox/
-├── sandbox.go          Engine interface, Profile, Command, ExecutionResult
-├── policy.go           StaticPolicy + PermissivePolicy
-├── provider.go         Optional Provider extension (Stat/ListDir/Spawn)
-├── inprocess.go        Host execution engine (CI / fallback)
-├── mock.go             In-memory fake for unit tests
-├── workspace.go        WorkspaceFS — escape-proof os.Root wrapper
-├── workspace_actions.go  read_file / write_file / edit_file actions
-├── system_tools.go     fs.read / fs.write / fs.patch / sandbox.exec
-├── library.go          ai/sandbox action library (workspace ops)
-├── docker/
-│   ├── docker.go       DockerSandboxEngine — long-lived workspace container
-│   └── cache.go        CacheManager — docker commit/save/load
-├── podman/
-│   └── podman.go       PodmanSandboxEngine — rootless parity with docker
-└── nexssflow/
-    ├── library.go      Flow Bundle factory + GlobalOptions
-    ├── directive.go    @sandbox NAME { ... } declaration handler
-    ├── materialize.go  Mounts sandbox.<name> actions on the resolver
-    ├── exec.go         runAndMerge — the shared exec implementation
-    ├── decl.go         SandboxDecl struct
-    ├── errors.go       errUnknownEngine
-    ├── selftest.go     SelfTest features for `nflow self test`
-    └── nflows/         Embedded *.nflow fixtures
+Go host / Nexss Flow
+          │
+          ▼
+  sandbox.Engine contract
+  ├── docker      container-backed workspace
+  ├── podman      Podman-backed workspace
+  ├── inprocess   direct host execution; trusted use only
+  └── mock        deterministic test double
+          │
+          ├── command execution and bounded results
+          └── workspace file operations and session lifecycle
 ```
 
-## Usage from a .nflow file
+## Install
 
-```nflow
-@require github.com/nexssp/sandbox/nexssflow {
-    engine:                "docker",
-    workspace:             ".sandbox",
-    image:                 "golang:1.26-alpine",
-    allowed_executables:   "go, git, gofmt",
-    allowed_env_keys:      "GOCACHE, GOPROXY",
-    no_cache:              false
-}
+Requires **Go 1.26.9 or newer**.
 
-@sandbox builder { image: "golang:1.26-alpine", memory_mb: 2048, cpus: 2.0, allowed_executables: "go, git, gofmt", allowed_env_keys: "GOCACHE, GOPROXY" }
-
-{ command: "go", args: ["test", "./..."] } -> sandbox.builder
+```
+go get github.com/nexssp/sandbox@latest
 ```
 
-The `as <alias>` feature of `@require` is honored. With the default static policy, generic `sandbox.exec` requires both a global `image` and `allowed_executables` option:
+The repository depends on Nexss Flow and Nexss Kernel for its Flow bundle and action integration.
 
-```nflow
-@require github.com/nexssp/sandbox/nexssflow as sb { engine: "mock", image: "alpine:latest", allowed_executables: "go" }
+## Engines
 
-{ command: "go", args: ["test"] } -> sb.exec
-```
+| Engine | Intended use | Notes |
+| --- | --- | --- |
+| `docker` | Container-backed command execution | Uses a long-lived workspace container; current enforcement caveats apply. |
+| `podman` | Podman-backed execution | Supports rootless setups; current enforcement caveats apply. |
+| `inprocess` | Trusted local command execution | Runs programs on the host; profile resource limits do not isolate the process. |
+| `mock` | Unit tests and deterministic test fixtures | A pure-Go fake; it recognizes a small set of commands such as `ls`, `cat`, `go`, and `gofmt`. |
 
-## Usage as a Go library
+## Go API
+
+The common `sandbox.Engine` contract covers command execution, workspace file operations, and session lifecycle. `Profile.ApplyDefaults` supplies request limits and execution defaults; direct callers should explicitly validate requests with a policy before running them. For example:
 
 ```go
 import (
+    "context"
+    "fmt"
+
     "github.com/nexssp/sandbox"
     "github.com/nexssp/sandbox/docker"
 )
 
-engine, err := docker.NewDockerSandboxEngine(docker.Config{
-    WorkspaceDir:  ".sandbox",
-    DefaultImage:  "golang:1.26-alpine",
-})
-if err != nil { return err }
-defer engine.Close()
+func runTests(ctx context.Context) error {
+    engine, err := docker.NewSandboxEngine(docker.Config{
+        WorkspaceDir: ".sandbox",
+        DefaultImage: "golang:1.26-alpine",
+    })
+    if err != nil {
+        return err
+    }
+    defer engine.Close()
 
-profile := sandbox.Profile{
-    Name:               "builder",
-    Image:              "golang:1.26-alpine",
-    MemoryMB:           2048,
-    CPUs:               2.0,
-    PidsLimit:          512,
-    NetworkMode:        "none",
-    ReadOnlyRootFS:     true,
-    AllowedExecutables: []string{"go", "git", "gofmt"},
+    profile := sandbox.Profile{
+        Name:               "builder",
+        Image:              "golang:1.26-alpine",
+        MemoryMB:           2048,
+        CPUs:               2.0,
+        PidsLimit:          512,
+        NetworkMode:        "none",
+        ReadOnlyRootFS:     true,
+        AllowedExecutables: []string{"go", "git", "gofmt"},
+    }
+    profile.ApplyDefaults()
+
+    policy := sandbox.StaticPolicy{}
+    if err := policy.ValidateProfile(profile); err != nil {
+        return err
+    }
+    command := sandbox.Command{Argv: []string{"go", "test", "./..."}}
+    if err := policy.ValidateCommand(profile, command); err != nil {
+        return err
+    }
+
+    result, err := engine.Run(ctx, "session-1", profile, command)
+    if err != nil {
+        return err
+    }
+    if result.ExitCode != 0 {
+        return fmt.Errorf("go test failed with exit code %d: %s", result.ExitCode, result.Stderr)
+    }
+    return nil
 }
-profile.ApplyDefaults()
-
-policy := sandbox.StaticPolicy{}
-if err := policy.ValidateProfile(profile); err != nil { return err }
-
-cmd := sandbox.Command{Argv: []string{"go", "test", "./..."}}
-if err := policy.ValidateCommand(profile, cmd); err != nil { return err }
-
-result, err := engine.Run(ctx, "session-1", profile, cmd)
-// result.ExitCode, result.Stdout, result.Stderr, result.Duration
 ```
 
-## Storage-backed file references
+`ExecutionResult` reports `ExitCode`, `Stdout`, `Stderr`, `Duration`, and whether output was `Truncated`. The Flow `sandbox.exec` action also returns `passed` and a string `duration`. An engine's `Run` method does not itself apply `StaticPolicy`; the Flow action validates its requests, while direct Go callers are responsible for applying policy checks.
 
-Flow `sandbox.exec` accepts `files` as `map[string]nexssflow.BlobRef` (an alias of `kernel/xfile.Ref`), not inline file contents. Each map key is a workspace-relative destination; each value is an opaque provider reference. The `Provider` and `ID` fields are never interpreted as a local path.
+## Nexss Flow 🌀 integration
 
-File references remain fail-closed unless a resolver is explicitly configured. A host may inject one directly with `nexssflow.BundleWithFileResolver`; with Flow v0.28.1, provider-scoped resolvers registered by other bundles are composed by `runner.BuildConfig` and exposed through the action context, so the Sandbox bundle can use the combined filesystem and Storage resolver without a custom multiplexer.
+The `nexssflow` bundle provides the generic `sandbox.exec` action and the `@sandbox NAME { ... }` directive for named profiles (for example, `sandbox.builder`). `sandbox.exec` uses the profile configured in `@require`; named actions use their own declared profile. The default static policy requires a profile image and executable allowlist. Bundle options also select the engine, workspace, cache, environment allowlist, and policy behavior.
 
-```go
-bundle := nexssflow.BundleWithFileResolver(flowOptions, resolver)
+The `as <alias>` form of `@require` is supported. This Docker example shows the generic action and a named profile; it requires an available Docker runtime. Keep the named profile image aligned with the global image because the current adapters reuse a long-lived workspace container and do not switch its image per profile.
+
+```
+@require github.com/nexssp/sandbox/nexssflow as sb {
+  engine: "docker",
+  workspace: ".sandbox",
+  image: "golang:1.26-alpine",
+  allowed_executables: "go, git, gofmt",
+  allowed_env_keys: "GOCACHE, GOPROXY"
+}
+
+@sandbox builder {
+  image: "golang:1.26-alpine",
+  memory_mb: 2048,
+  cpus: 2.0,
+  allowed_executables: "go, git, gofmt",
+  allowed_env_keys: "GOCACHE, GOPROXY"
+}
+
+{ command: "go", args: ["test", "./..."] } -> sb.builder
+{ command: "go", args: ["test"] } -> sb.exec
 ```
 
-The resolver receives the action context. Sandbox checks authenticated caller and tenant scope with `xfile.ScopeFromContext` before opening a reference, then verifies the returned provider/object identity, optional version and expected size, the actual byte count, and the `sha256:<hex>` digest. It streams through a bounded buffer into a private temporary file, removes partial data on cancellation or error, and only then installs the verified file through a confined, atomic workspace write. `MaxFileBytes` is enforced on each resolved file. The normal registry factory (`Bundle`) has no resolver and returns `Unavailable` if a request contains file refs; there is no implicit storage-provider lookup.
+This compact integration example uses the deterministic mock engine. It exercises both the named and generic actions without starting a container or running a host command:
 
-Examples 06–07 show host-supplied provider references. Static `@embed` plus Storage staging through `sandbox.exec` is covered by `TestSandboxBundle_EndToEnd_StagesStaticEmbedAndStorageRef` in [`nexssflow/end_to_end_test.go`](nexssflow/end_to_end_test.go).
+```
+@require github.com/nexssp/sandbox/nexssflow as sb {
+  engine: "mock",
+  workspace: ".sandbox_flow",
+  enforce_policy: "false"
+}
+@sandbox builder { image: "golang:1.26-alpine", memory_mb: 2048, cpus: 2.0 }
 
-**Flow v0.28.1 static embed + Storage integration is verified.** The published `extensions/embed` bundle creates typed `xfile.Ref` values from a declared `fs.FS` and registers an FS-backed resolver. `runner.BuildConfig` composes it with provider-scoped Storage resolvers and exposes the composite through the action context; the Sandbox adapter uses that context resolver when no direct resolver was injected. The end-to-end test executes `@embed logo`, passes the resulting static ref and a Storage BlobRef through `sandbox.exec`, and checks both staged payloads. Storage is represented by a deterministic test resolver; this does not exercise a production Storage service or a real container runtime.
+{ command: "go", args: ["test", "./..."] } -> sb.builder
+{ command: "go", args: ["test"] } -> sb.exec
+```
 
-## Policy
+The result includes `exit_code`, `stdout`, `stderr`, `duration`, `truncated`, and `passed`. With the default policy enabled, the global `@require` profile used by `sb.exec` must also set `image` and `allowed_executables`. `enforce_policy: "false"` is shown only to keep the mock fixture minimal; do not disable policy for untrusted inputs. The `mock` engine is a deterministic test double, not a command-execution sandbox.
 
-`StaticPolicy` is the default. It rejects:
+### Workspace files and typed references
 
-- Profiles with `NetworkMode != "none"` (host networking).
-- Profiles with `ReadOnlyRootFS == false` (writable rootfs).
-- Profiles with any of `MemoryMB`, `CPUs`, `PidsLimit`, `MaxWallTime`,
-  `MaxOutputBytes`, `MaxFileBytes`, `MaxCommandArgs`, or
-  `MaxCommandArgBytes` set to zero.
-- Profiles with no `AllowedExecutables`.
-- Commands whose `Argv[0]` is not on the allowlist.
-- Commands whose `Argv[0]` contains a path separator (`/` or `\`).
-- Commands whose argv contains a NUL byte or exceeds `MaxCommandArgBytes`.
+Host-side workspace reads and writes use `WorkspaceFS` backed by Go's `os.Root`, confining paths and installing writes atomically. Flow `sandbox.exec` accepts `files` as a map from workspace-relative destination paths to typed `xfile.Ref` values (`nexssflow.BlobRef` is an alias); it does not take inline file contents as file references. Provider and object IDs are opaque and are never interpreted as local paths.
+
+File references remain fail-closed unless the host explicitly supplies an authorized `xfile.Resolver`, for example with `nexssflow.BundleWithFileResolver`. The adapter checks caller/tenant scope, validates the provider/object identity returned by the resolver, and checks any requested version, size, and SHA-256 digest. It bounds each file by `MaxFileBytes`, stages and verifies resolved content before installing it into the workspace, and rejects invalid destinations. The standard `@require` bundle does not automatically connect Storage providers; without a resolver, requests containing file references return unavailable.
+
+> **WIP — automatic file-provider wiring:** `BundleWithFileResolver` supports a host-injected resolver, but ordinary `@require` does not yet connect Storage providers automatically. File references fail closed until the host supplies an authorized resolver.
+
+Runnable ecosystem examples now live in the [Nexss examples repository](https://github.com/nexssp/examples).
+
+## Policy and enforcement boundary
+
+`StaticPolicy` is the default policy used by the Flow bundle. It rejects:
+
+- Profiles without a name, image, positive resource and request bounds, or an executable allowlist; profiles must use `NetworkMode: "none"` and a read-only root filesystem.
+
+- Commands with no argv, too many arguments, an executable path rather than a bare name, an executable outside the profile allowlist, NUL bytes, or an argument longer than `MaxCommandArgBytes`.
+
 - Environment entries that are malformed, contain NUL bytes, or use a key not listed in `AllowedEnvKeys`.
-- Writes whose path is absolute, contains `..`, or exceeds
-  `MaxFileBytes`.
 
-`PermissivePolicy` disables every check. Use it only in trusted, hermetic
-CI environments where the caller has already vetted the inputs.
+- File writes with an empty or absolute path, a `..` path component, a negative size, or a payload larger than `MaxFileBytes`.
 
-The `@require` option `enforce_policy: "false"` switches the bundle to
-`PermissivePolicy`. The default is `"true"`.
+`PermissivePolicy` disables these checks. In Flow, `enforce_policy: "false"` selects it; use that only with trusted, hermetic fixtures whose inputs have already been vetted. Direct Go callers must invoke the policy checks themselves if they need request validation.
 
-> **Enforcement boundary:** `StaticPolicy` validates requests; it is not an OS security boundary, and direct callers must invoke the policy checks themselves. The host-side `ReadFile`/`WriteFile` methods use `WorkspaceFS` backed by Go's `os.Root`, rejecting lexical and symlink escapes and enforcing `MaxFileBytes`; writes are installed atomically from a temporary file within the workspace. This confines file operations but does not isolate command execution. `inprocess` runs commands directly on the host and must only be used with trusted commands. The Flow `sandbox.exec` action applies `MaxWallTime` to every run and caps a caller-supplied timeout at that profile limit. Docker `Engine.Run` bounds captured stdout and stderr independently by `MaxOutputBytes`; environment keys are checked against `AllowedEnvKeys`. Those controls do not cover Docker `ExecAdvanced` or Podman's output capture. Docker and Podman mount the host workspace read-write; both reuse a long-lived container, ignore per-profile resource-update failures, and do not switch the container image for each named profile. Runtime-backed isolation was not verified here, so do not treat Docker or Podman as hardened for untrusted workloads until the remaining gaps are closed and tested against real runtimes.
+> **Enforcement boundary:** Policy checks validate requests; they do not isolate command execution. The host-side `ReadFile` and `WriteFile` operations use `WorkspaceFS` backed by Go's `os.Root`, rejecting lexical and symlink escapes and installing writes atomically. The Flow `sandbox.exec` action applies `MaxWallTime` to each run and caps a requested timeout at the profile limit. Docker's normal `Engine.Run` bounds captured stdout and stderr independently by `MaxOutputBytes`; that bound does not cover Docker `ExecAdvanced` or Podman's output capture. Docker and Podman mount the host workspace read-write, reuse a long-lived container, may ignore per-profile resource-update failures, and do not switch the container image for each named profile. Runtime-backed isolation has not been verified here. Do not use `inprocess` for untrusted commands or treat Docker/Podman as hardened isolation until the remaining gaps are closed and tested against real runtimes.
 
 ## Profile defaults
 
-`Profile.ApplyDefaults()` fills in safe values for every field the
-engines consult:
+`Profile.ApplyDefaults()` fills in defaults for fields used by the engines. Explicit resource values in your profile override the corresponding positive-valued defaults; `ReadOnlyRootFS` is set to `true`.
 
-| Field                | Default        |
-| -------------------- | -------------- |
-| `MemoryMB`           | `1024`         |
-| `CPUs`               | `1.0`          |
-| `NetworkMode`        | `"none"`       |
-| `User`               | `<uid>:<gid>`  |
-| `Workspace`          | `"/workspace"` |
-| `PidsLimit`          | `64`           |
-| `MaxWallTime`        | `2m`           |
-| `MaxOutputBytes`     | `1 MiB`        |
-| `MaxFileBytes`       | `5 MiB`        |
-| `MaxCommandArgs`     | `64`           |
-| `MaxCommandArgBytes` | `32 KiB`       |
-| `ReadOnlyRootFS`     | `true`         |
+| Field | Default |
+| --- | --- |
+| `MemoryMB` | `1024` |
+| `CPUs` | `1.0` |
+| `NetworkMode` | `"none"` |
+| `User` | Current effective `<uid>:<gid>` (or `1000:1000` when unavailable) |
+| `Workspace` | `"/workspace"` |
+| `PidsLimit` | `64` |
+| `MaxWallTime` | `2m` |
+| `MaxOutputBytes` | `1 MiB` |
+| `MaxFileBytes` | `5 MiB` |
+| `MaxCommandArgs` | `64` |
+| `MaxCommandArgBytes` | `32 KiB` |
+| `ReadOnlyRootFS` | `true` |
+
+These are request/profile defaults, not proof that a backend enforces those restrictions as an OS-level boundary.
 
 ## Engine contract
 
-Every engine implements:
+Every engine implements the common lifecycle and workspace interface:
 
 ```go
 type Engine interface {
     Name() string
-    Run(ctx, sessionID, profile, command) (ExecutionResult, error)
-    WriteFile(ctx, sessionID, profile, relativePath, content) error
-    ReadFile(ctx, sessionID, profile, relativePath) ([]byte, error)
-    Reset(ctx, sessionID) error
+    Run(ctx context.Context, sessionID string, profile Profile, command Command) (ExecutionResult, error)
+    WriteFile(ctx context.Context, sessionID string, profile Profile, relativePath string, content []byte) error
+    ReadFile(ctx context.Context, sessionID string, profile Profile, relativePath string) ([]byte, error)
+    Reset(ctx context.Context, sessionID string) error
     Close() error
 }
 ```
 
-`Provider` is an optional extension for engines that also expose
-filesystem introspection (`Stat`, `ListDir`, `OpenStream`) and
-long-lived background processes (`SpawnBackground`). The bundled
-engines do not implement it today; the interface is reserved for
-A2A-worker engines that need cross-engine introspection.
+`Provider` is an optional extension for filesystem introspection (`Stat`, `ListDir`, `OpenStream`) and long-lived background processes (`SpawnBackground`). The bundled engines do not implement this cross-engine interface today; use engine-specific APIs where available.
 
-## Flow showcase
+## Packages
 
-The Flow integration examples are in [`examples`](examples/README.md). Examples 01–05 demonstrate command workflows; examples 06–07 demonstrate host-supplied BlobRefs. The module pins Flow v0.28.1 and Kernel v0.32.0.
+| Package | Purpose |
+| --- | --- |
+| [`sandbox`](.) | Engine, profile, command/result types, policies, mock and in-process engines, and confined workspace operations. |
+| [`docker`](docker/) | Docker engine and workspace cache support. |
+| [`podman`](podman/) | Podman engine adapter. |
+| [`nexssflow`](nexssflow/) | Flow bundle, named sandbox directive, execution action, and embedded fixtures. |
 
-Some examples select `inprocess`, which executes commands on the host. Use that backend only for trusted demonstrations; it does not isolate model-generated or other untrusted code. Docker and Podman remain unverified against a real container runtime for this review; see the enforcement boundary above.
+## Development
 
-## Testing
+Install [Task](https://taskfile.dev), then run the repository's test task or CI gate:
 
-```bash
-go test ./...
+```
+task test
+task test -- ./docker
+task ci
 ```
 
-The unit and end-to-end tests use fake or harmless local fixtures; they do not require a live model or container daemon. Run this command from the module root with Go 1.26.9 or later. A passing test suite does not verify Docker or Podman isolation.
+`task test` runs the short test suite; pass a package after `--` to limit it. `task ci` runs lint and uncached race tests, as defined in `Taskfile.yml`. The tests use fakes or harmless local fixtures and do not require a model or container daemon. Passing tests does not verify Docker or Podman isolation against a real runtime.
+
+## Related projects
+
+- [Nexss Flow](https://github.com/nexssp/flow) — Flow language and runtime.
+
+- [Nexss Kernel](https://github.com/nexssp/kernel) — typed actions and request context.
+
+- [Nexss Storage](https://github.com/nexssp/storage) — storage adapters that can provide scoped file references.
