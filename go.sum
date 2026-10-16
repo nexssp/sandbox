@@ -33,10 +33,10 @@ github.com/mattn/go-colorable v0.1.13/go.mod h1:7S9/ev0klgBDR4GtXTXX8a3vIGJpMovk
 github.com/mattn/go-isatty v0.0.16/go.mod h1:kYGgaQfpe5nmfYZH+SKPsOc2e4SrIfOl2e/yFXSvRLM=
 github.com/mattn/go-isatty v0.0.20 h1:xfD0iDuEKnDkl03q4limB+vH+GxLEtL/jb4xVJSWWEY=
 github.com/mattn/go-isatty v0.0.20/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D7dTCTo3Y=
-github.com/nexssp/flow v0.28.1 h1:6DHBR8bb0tXVQHBO/0ocK5rkpdzD5c11UI1jm8fdEJk=
-github.com/nexssp/flow v0.28.1/go.mod h1:3xCOePj0zixyYoQvdxCYfssMWGST/wiJXZMvo6y4gGo=
-github.com/nexssp/kernel v0.32.0 h1:Xkf9btSyT8bsrg9lTjCNSjaT0J9CR7t1uzt4/eyCzDY=
-github.com/nexssp/kernel v0.32.0/go.mod h1:hQvWapQSk0VNS0ufG84j6fTnEYFuc+inehGLYQ0kEdc=
+github.com/nexssp/flow v0.34.0 h1:PqpLjBtNE0QtkEbq1xVyssflRtj3ucWHDIPcf+KrHjU=
+github.com/nexssp/flow v0.34.0/go.mod h1:d14spwviPBiA/Q85Z5fw31O7qlqABF02mv+kWiL+ya4=
+github.com/nexssp/kernel v0.35.0 h1:dHj4dvUnNH4RC0ImAC26olaAK667HFF30XJFTpr6DLg=
+github.com/nexssp/kernel v0.35.0/go.mod h1:hQvWapQSk0VNS0ufG84j6fTnEYFuc+inehGLYQ0kEdc=
 github.com/nexssp/validation v0.3.0 h1:j9iLKqXqDIQfUijEGEEnhZYESj8GILIYqznSDKa0fxE=
 github.com/nexssp/validation v0.3.0/go.mod h1:S7Z7soTGH2S6/Z61cFVZMvonr3yYyTG2vY/cci8fEUE=
 github.com/rogpeppe/go-internal v1.11.0 h1:cWPaGQEPrBb5/AsnsZesgZZ9yb1OQ+GOISoDNXVBh4M=

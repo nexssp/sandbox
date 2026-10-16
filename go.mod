@@ -3,8 +3,8 @@ module github.com/nexssp/sandbox
 go 1.26.9
 
 require (
-	github.com/nexssp/flow v0.28.1
-	github.com/nexssp/kernel v0.32.0
+	github.com/nexssp/flow v0.34.0
+	github.com/nexssp/kernel v0.35.0
 )
 
 require (
