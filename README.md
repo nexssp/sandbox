@@ -13,7 +13,7 @@
 
 Nexss Sandbox provides a Go `sandbox.Engine` contract for command execution, workspace file access, and reset/close lifecycle. Docker, Podman, in-process, and mock engines implement the same interface; their isolation properties differ.
 
-> **Important:** `StaticPolicy` validates profiles, commands, environment keys, and file writes; it is not an operating-system security boundary. The `inprocess` engine executes commands directly on the host and is for trusted use only. The Docker and Podman adapters have known enforcement gaps and have not been verified against a real runtime here. Do not treat this package as hardened isolation for untrusted code.
+> **Important:** `StaticPolicy` validates profiles, commands, environment keys, and file writes; it is not an operating-system security boundary. The `inprocess` engine executes commands directly on the host and is for trusted use only. Docker and Podman now isolate containers and host workspaces by session and fail rather than running commands on the host when the runtime is unavailable. Their runtime-backed isolation has not been verified here, so do not treat this package as hardened isolation for untrusted code.
 
 ## Architecture
 
@@ -45,8 +45,8 @@ The repository depends on Nexss Flow and Nexss Kernel for its Flow bundle and ac
 
 | Engine | Intended use | Notes |
 | --- | --- | --- |
-| `docker` | Container-backed command execution | Uses a long-lived workspace container; current enforcement caveats apply. |
-| `podman` | Podman-backed execution | Supports rootless setups; current enforcement caveats apply. |
+| `docker` | Container-backed command execution | Uses one long-lived container and workspace per session. |
+| `podman` | Podman-backed execution | Supports rootless setups; uses one long-lived container and workspace per session. |
 | `inprocess` | Trusted local command execution | Runs programs on the host; profile resource limits do not isolate the process. |
 | `mock` | Unit tests and deterministic test fixtures | A pure-Go fake; it recognizes a small set of commands such as `ls`, `cat`, `go`, and `gofmt`. |
 
@@ -111,7 +111,7 @@ func runTests(ctx context.Context) error {
 
 The `nexssflow` bundle provides the generic `sandbox.exec` action and the `@sandbox NAME { ... }` directive for named profiles (for example, `sandbox.builder`). `sandbox.exec` uses the profile configured in `@require`; named actions use their own declared profile. The default static policy requires a profile image and executable allowlist. Bundle options also select the engine, workspace, cache, environment allowlist, and policy behavior.
 
-The `as <alias>` form of `@require` is supported. This Docker example shows the generic action and a named profile; it requires an available Docker runtime. Keep the named profile image aligned with the global image because the current adapters reuse a long-lived workspace container and do not switch its image per profile.
+The `as <alias>` form of `@require` is supported. This Docker example shows the generic action and a named profile; it requires an available Docker runtime. Keep the named profile image aligned with the global image because each session's long-lived container uses the configured default image and does not switch images per profile.
 
 ```
 @require github.com/nexssp/sandbox/nexssflow as sb {
@@ -152,7 +152,7 @@ The result includes `exit_code`, `stdout`, `stderr`, `duration`, `truncated`, an
 
 ### Workspace files and typed references
 
-Host-side workspace reads and writes use `WorkspaceFS` backed by Go's `os.Root`, confining paths and installing writes atomically. Flow `sandbox.exec` accepts `files` as a map from workspace-relative destination paths to typed `xfile.Ref` values (`nexssflow.BlobRef` is an alias); it does not take inline file contents as file references. Provider and object IDs are opaque and are never interpreted as local paths.
+Host-side workspace reads and writes use `WorkspaceFS` backed by Go's `os.Root`, confining paths and installing writes atomically. Docker and Podman give each session its own container and workspace directory. The default session uses `<workspace>` directly for backward compatibility; named sessions live under `<workspace>/.sessions/<sha256(sessionID)>`. `Reset` removes only the selected session's container and workspace. For the default session, `Reset("")` removes everything under the base workspace directory. Flow `sandbox.exec` accepts `files` as a map from workspace-relative destination paths to typed `xfile.Ref` values (`nexssflow.BlobRef` is an alias); it does not take inline file contents as file references. Provider and object IDs are opaque and are never interpreted as local paths.
 
 File references remain fail-closed unless the host explicitly supplies an authorized `xfile.Resolver`. Storage's `BlobStore` implements that resolver contract; the host can add the provider binding to its Flow bundle set before building the runner configuration:
 
@@ -186,7 +186,7 @@ Runnable ecosystem examples now live in the [Nexss examples repository](https://
 
 `PermissivePolicy` disables these checks. In Flow, `enforce_policy: "false"` selects it; use that only with trusted, hermetic fixtures whose inputs have already been vetted. Direct Go callers must invoke the policy checks themselves if they need request validation.
 
-> **Enforcement boundary:** Policy checks validate requests; they do not isolate command execution. The host-side `ReadFile` and `WriteFile` operations use `WorkspaceFS` backed by Go's `os.Root`, rejecting lexical and symlink escapes and installing writes atomically. The Flow `sandbox.exec` action applies `MaxWallTime` to each run and caps a requested timeout at the profile limit. Docker's normal `Engine.Run` bounds captured stdout and stderr independently by `MaxOutputBytes`; that bound does not cover Docker `ExecAdvanced` or Podman's output capture. Docker and Podman mount the host workspace read-write, reuse a long-lived container, may ignore per-profile resource-update failures, and do not switch the container image for each named profile. Runtime-backed isolation has not been verified here. Do not use `inprocess` for untrusted commands or treat Docker/Podman as hardened isolation until the remaining gaps are closed and tested against real runtimes.
+> **Enforcement boundary:** Policy checks validate requests; they do not isolate command execution. The host-side `ReadFile` and `WriteFile` operations use `WorkspaceFS` backed by Go's `os.Root`, rejecting lexical and symlink escapes and installing writes atomically. The Flow `sandbox.exec` action applies `MaxWallTime` to each run and caps a requested timeout at the profile limit. Docker's normal `Engine.Run` bounds captured stdout and stderr independently by `MaxOutputBytes`; that bound does not cover Docker `ExecAdvanced` or Podman's output capture. Docker and Podman mount each session's host workspace read-write and do not switch the container image for each named profile. Resource-update failures abort commands, and the legacy `AllowLocalFallback` option is ignored. Runtime-backed isolation has not been verified here; do not use `inprocess` for untrusted commands or treat Docker/Podman as hardened isolation until tested against real runtimes and remaining enforcement gaps are closed.
 
 ## Profile defaults
 

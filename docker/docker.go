@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -65,8 +67,10 @@ type ExecRecord struct {
 }
 
 type Config struct {
-	WorkspaceDir       string
-	DefaultImage       string
+	WorkspaceDir string
+	DefaultImage string
+	// Deprecated: retained for source compatibility and ignored. Docker-backed
+	// execution never falls back to running commands on the host.
 	AllowLocalFallback bool
 	EventHandler       func(ExecRecord)
 
@@ -81,11 +85,18 @@ type SandboxEngine struct {
 	workspaceDir  string
 	defaultImage  string
 	containerName string
-	useLocal      bool
 	runCount      int
 	activeServers []string
 	eventHandler  func(ExecRecord)
 	cache         *CacheManager
+	sessions      map[string]*sandboxSession
+}
+
+type sandboxSession struct {
+	mu               sync.Mutex
+	containerName    string
+	workspaceDir     string
+	containerCreated bool
 }
 
 func NewSandboxEngine(cfg Config) (*SandboxEngine, error) {
@@ -111,16 +122,10 @@ func NewSandboxEngine(cfg Config) (*SandboxEngine, error) {
 		image = "golang:1.25-alpine"
 	}
 
-	useLocal := false
-
 	probeCtx, cancelProbe := context.WithTimeout(context.Background(), dockerProbeTimeout)
 	if _, err := exec.CommandContext(probeCtx, "docker", "version").Output(); err != nil {
-		if !cfg.AllowLocalFallback {
-			cancelProbe()
-			return nil, xerr.Unavailable("docker daemon is unreachable and local fallback is not allowed", err)
-		}
-
-		useLocal = true
+		cancelProbe()
+		return nil, xerr.Unavailable("docker daemon is unreachable; host fallback is disabled", err)
 	}
 	cancelProbe()
 
@@ -133,12 +138,12 @@ func NewSandboxEngine(cfg Config) (*SandboxEngine, error) {
 		workspaceDir:  absWorkDir,
 		defaultImage:  image,
 		containerName: containerName,
-		useLocal:      useLocal,
 		eventHandler:  cfg.EventHandler,
 		activeServers: make([]string, 0),
+		sessions:      make(map[string]*sandboxSession),
 	}
 
-	if !useLocal && !cfg.DisableCache {
+	if !cfg.DisableCache {
 		cacheDir := cfg.CacheDir
 		if cacheDir == "" {
 			cacheDir = filepath.Join(absWorkDir, ".jumalu_cache")
@@ -155,14 +160,12 @@ func NewSandboxEngine(cfg Config) (*SandboxEngine, error) {
 		}
 	}
 
-	if !useLocal {
-		if err := engine.ensureWorkspaceContainer(context.Background()); err != nil {
-			if cfg.AllowLocalFallback {
-				engine.useLocal = true
-			} else {
-				return nil, fmt.Errorf("failed starting sandbox container: %w", err)
-			}
-		}
+	defaultSession := engine.getSession("")
+	defaultSession.mu.Lock()
+	ensureErr := engine.ensureWorkspaceContainer(context.Background(), defaultSession)
+	defaultSession.mu.Unlock()
+	if ensureErr != nil {
+		return nil, fmt.Errorf("failed starting sandbox container: %w", ensureErr)
 	}
 
 	return engine, nil
@@ -181,7 +184,7 @@ func (d *SandboxEngine) Name() string { return "docker-sandbox-engine" }
 func (d *SandboxEngine) Cache() *CacheManager { return d.cache }
 
 func (d *SandboxEngine) CommitToCache(ctx context.Context, tool, recipe string) error {
-	if d.cache == nil || !d.cache.Enabled() || d.useLocal {
+	if d.cache == nil || !d.cache.Enabled() {
 		return nil
 	}
 
@@ -216,29 +219,68 @@ func (d *SandboxEngine) resolveBaseImage(ctx context.Context) string {
 	return img
 }
 
-func (d *SandboxEngine) ensureWorkspaceContainer(ctx context.Context) error {
+func sessionIDKey(sessionID string) string {
+	if sessionID == "" {
+		return "default"
+	}
+	return sessionID
+}
+
+func sessionDigest(sessionID string) string {
+	sum := sha256.Sum256([]byte(sessionIDKey(sessionID)))
+	return hex.EncodeToString(sum[:])
+}
+
+func (d *SandboxEngine) getSession(sessionID string) *sandboxSession {
+	key := sessionIDKey(sessionID)
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.sessions == nil {
+		d.sessions = make(map[string]*sandboxSession)
+	}
+	if session, ok := d.sessions[key]; ok {
+		return session
+	}
+	containerName := d.containerName
+	if key != "default" {
+		containerName += "-" + sessionDigest(key)
+	}
+	workspaceDir := filepath.Join(d.workspaceDir, ".sessions", sessionDigest(key))
+	if key == "default" {
+		workspaceDir = d.workspaceDir
+	}
+	session := &sandboxSession{
+		containerName: containerName,
+		workspaceDir:  workspaceDir,
+	}
+	d.sessions[key] = session
+	return session
+}
 
-	// #nosec G204 -- containerName is generated internally by NewSandboxEngine.
-	checkCmd := exec.CommandContext(ctx, "docker", "ps", "--filter", "name="+d.containerName, "--format", "{{.Names}}")
+func (d *SandboxEngine) ensureWorkspaceContainer(ctx context.Context, session *sandboxSession) error {
+	if err := os.MkdirAll(session.workspaceDir, 0o755); err != nil {
+		return fmt.Errorf("create session workspace: %w", err)
+	}
+
+	// #nosec G204 -- containerName is generated internally from an engine nonce and a session hash.
+	checkCmd := exec.CommandContext(ctx, "docker", "ps", "--filter", "name="+session.containerName, "--format", "{{.Names}}")
 	out, checkErr := checkCmd.Output()
 	if checkErr != nil {
 		slog.Debug("docker: ps check failed", "err", checkErr)
 	}
-	isRunning := strings.Contains(string(out), d.containerName)
-
-	if isRunning {
+	if slices.Contains(strings.Fields(string(out)), session.containerName) {
+		session.containerCreated = true
 		return nil
 	}
 
-	// #nosec G204 -- containerName is generated internally by NewSandboxEngine.
-	if err := exec.CommandContext(ctx, "docker", "start", d.containerName).Run(); err == nil {
+	// #nosec G204 -- containerName is generated internally from an engine nonce and a session hash.
+	if err := exec.CommandContext(ctx, "docker", "start", session.containerName).Run(); err == nil {
+		session.containerCreated = true
 		return nil
 	}
 
-	// #nosec G204 -- containerName is generated internally by NewSandboxEngine.
-	if rmErr := exec.CommandContext(ctx, "docker", "rm", "-f", d.containerName).Run(); rmErr != nil {
+	// #nosec G204 -- containerName is generated internally from an engine nonce and a session hash.
+	if rmErr := exec.CommandContext(ctx, "docker", "rm", "-f", session.containerName).Run(); rmErr != nil {
 		slog.Debug("docker: pre-run cleanup failed", "err", rmErr)
 	}
 
@@ -246,7 +288,7 @@ func (d *SandboxEngine) ensureWorkspaceContainer(ctx context.Context) error {
 
 	runArgs := []string{
 		"run", "-d",
-		"--name", d.containerName,
+		"--name", session.containerName,
 		"--memory", "2048m",
 		"--cpus", "2.0",
 		"--pids-limit", "512",
@@ -258,7 +300,7 @@ func (d *SandboxEngine) ensureWorkspaceContainer(ctx context.Context) error {
 		"-e", "DEBIAN_FRONTEND=noninteractive",
 		"-e", "DEBCONF_NOWARNINGS=yes",
 		"--tmpfs", "/tmp:rw,exec,nosuid,size=512m",
-		"--mount", fmt.Sprintf("type=bind,src=%s,dst=/workspace", d.workspaceDir),
+		"--mount", fmt.Sprintf("type=bind,src=%s,dst=/workspace", session.workspaceDir),
 		"-w", "/workspace",
 		baseImage,
 		"tail", "-f", "/dev/null",
@@ -267,6 +309,7 @@ func (d *SandboxEngine) ensureWorkspaceContainer(ctx context.Context) error {
 	if out, err := exec.CommandContext(ctx, "docker", runArgs...).CombinedOutput(); err != nil {
 		return fmt.Errorf("docker run: %w: %s", err, string(out))
 	}
+	session.containerCreated = true
 
 	return nil
 }
@@ -402,8 +445,15 @@ func (d *SandboxEngine) runStreaming(
 }
 
 func (d *SandboxEngine) ExecAdvanced(ctx context.Context, req ExecCommandReq) (sandbox.ExecutionResult, error) {
+	session := d.getSession("")
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if err := d.ensureWorkspaceContainer(ctx, session); err != nil {
+		return sandbox.ExecutionResult{}, err
+	}
+
 	d.mu.RLock()
-	containerName := d.containerName
+	containerName := session.containerName
 	image := d.defaultImage
 	handler := d.eventHandler
 	d.mu.RUnlock()
@@ -508,61 +558,49 @@ func (d *SandboxEngine) ExecAdvanced(ctx context.Context, req ExecCommandReq) (s
 	return res, werr
 }
 
-func (d *SandboxEngine) Run(ctx context.Context, _ string, profile sandbox.Profile, command sandbox.Command) (sandbox.ExecutionResult, error) {
+func (d *SandboxEngine) Run(ctx context.Context, sessionID string, profile sandbox.Profile, command sandbox.Command) (sandbox.ExecutionResult, error) {
 	if len(command.Argv) == 0 {
 		return sandbox.ExecutionResult{ExitCode: 1, Stderr: "empty command"}, nil
 	}
+	profile.ApplyDefaults()
+	session := d.getSession(sessionID)
+	session.mu.Lock()
+	defer session.mu.Unlock()
 
 	imageUsed := profile.Image
 	if imageUsed == "" {
 		imageUsed = d.defaultImage
 	}
 
-	containerLabel := d.containerName
+	containerLabel := session.containerName
+	if err := d.ensureWorkspaceContainer(ctx, session); err != nil {
+		return sandbox.ExecutionResult{}, err
+	}
+	if err := d.applyResourceLimits(ctx, session.containerName, profile); err != nil {
+		return sandbox.ExecutionResult{}, err
+	}
 
-	var cmd *exec.Cmd
+	execArgs := []string{
+		"exec", "-i=false",
+		"-w", profile.Workspace,
+		"-e", "DEBIAN_FRONTEND=noninteractive",
+		"-e", "DEBCONF_NOWARNINGS=yes",
+	}
 
-	if d.useLocal {
-		// #nosec G204 -- Executing the supplied argv is this engine's contract; no shell is involved.
-		cmd = exec.CommandContext(ctx, command.Argv[0], command.Argv[1:]...)
-		cmd.Dir = d.workspaceDir
-		if len(command.Env) > 0 {
-			cmd.Env = append(os.Environ(), command.Env...)
-		}
-		if len(command.Stdin) > 0 {
-			cmd.Stdin = bytes.NewReader(command.Stdin)
-		}
-		containerLabel = "local"
-	} else {
-		if err := d.ensureWorkspaceContainer(ctx); err != nil {
-			return sandbox.ExecutionResult{}, err
-		}
+	if profile.User != "" {
+		execArgs = append(execArgs, "--user", profile.User)
+	}
 
-		d.applyResourceLimits(ctx, profile)
+	for _, e := range command.Env {
+		execArgs = append(execArgs, "-e", e)
+	}
 
-		execArgs := []string{
-			"exec", "-i=false",
-			"-w", profile.Workspace,
-			"-e", "DEBIAN_FRONTEND=noninteractive",
-			"-e", "DEBCONF_NOWARNINGS=yes",
-		}
+	execArgs = append(execArgs, session.containerName)
+	execArgs = append(execArgs, command.Argv...)
 
-		if profile.User != "" {
-			execArgs = append(execArgs, "--user", profile.User)
-		}
-
-		for _, e := range command.Env {
-			execArgs = append(execArgs, "-e", e)
-		}
-
-		execArgs = append(execArgs, d.containerName)
-		execArgs = append(execArgs, command.Argv...)
-
-		cmd = exec.CommandContext(ctx, "docker", execArgs...)
-
-		if len(command.Stdin) > 0 {
-			cmd.Stdin = bytes.NewReader(command.Stdin)
-		}
+	cmd := exec.CommandContext(ctx, "docker", execArgs...)
+	if len(command.Stdin) > 0 {
+		cmd.Stdin = bytes.NewReader(command.Stdin)
 	}
 
 	rec := ExecRecord{
@@ -600,7 +638,7 @@ func (d *SandboxEngine) Run(ctx context.Context, _ string, profile sandbox.Profi
 	}, nil
 }
 
-func (d *SandboxEngine) applyResourceLimits(ctx context.Context, profile sandbox.Profile) {
+func (d *SandboxEngine) applyResourceLimits(ctx context.Context, containerName string, profile sandbox.Profile) error {
 	args := []string{"update"}
 	if profile.MemoryMB > 0 {
 		args = append(args, "--memory", strconv.Itoa(profile.MemoryMB)+"m")
@@ -611,28 +649,21 @@ func (d *SandboxEngine) applyResourceLimits(ctx context.Context, profile sandbox
 	if profile.PidsLimit > 0 {
 		args = append(args, "--pids-limit", strconv.Itoa(profile.PidsLimit))
 	}
-	args = append(args, d.containerName)
+	args = append(args, containerName)
 
-	if err := exec.CommandContext(ctx, "docker", args...).Run(); err != nil {
-		slog.Debug("docker: update resource limits failed", "err", err)
+	if out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("docker update resource limits: %w: %s", err, strings.TrimSpace(string(out)))
 	}
+	return nil
 }
 
 func (d *SandboxEngine) InspectContainer(ctx context.Context) ContainerInspectInfo {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+	session := d.getSession("")
+	session.mu.Lock()
+	defer session.mu.Unlock()
 
-	if d.useLocal {
-		return ContainerInspectInfo{
-			Name:   "local-host",
-			Status: "Local Host Environment (No Docker)",
-			Image:  "host-native",
-			Mount:  d.workspaceDir,
-		}
-	}
-
-	// #nosec G204 -- containerName is generated internally by NewSandboxEngine.
-	psCmd := exec.CommandContext(ctx, "docker", "top", d.containerName)
+	// #nosec G204 -- containerName is generated internally from an engine nonce and a session hash.
+	psCmd := exec.CommandContext(ctx, "docker", "top", session.containerName)
 	psOut, err := psCmd.Output()
 
 	var procs []string
@@ -646,10 +677,10 @@ func (d *SandboxEngine) InspectContainer(ctx context.Context) ContainerInspectIn
 	}
 
 	return ContainerInspectInfo{
-		Name:      d.containerName,
+		Name:      session.containerName,
 		Status:    "Running",
 		Image:     d.defaultImage,
-		Mount:     d.workspaceDir + " -> /workspace",
+		Mount:     session.workspaceDir + " -> /workspace",
 		Processes: procs,
 		Memory:    "2048 MB",
 		PIDs:      "512",
@@ -661,9 +692,6 @@ func (d *SandboxEngine) Info() string {
 	defer d.mu.RUnlock()
 
 	mode := fmt.Sprintf("Workspace Container: [%s]", d.containerName)
-	if d.useLocal {
-		mode = "Local Host"
-	}
 
 	active := len(d.activeServers)
 
@@ -679,9 +707,12 @@ func (d *SandboxEngine) Info() string {
 		mode, d.defaultImage, active, d.runCount, cacheInfo)
 }
 
-func (d *SandboxEngine) WriteFile(_ context.Context, _ string, profile sandbox.Profile, relativePath string, content []byte) error {
+func (d *SandboxEngine) WriteFile(_ context.Context, sessionID string, profile sandbox.Profile, relativePath string, content []byte) error {
 	profile.ApplyDefaults()
-	workspace, err := sandbox.OpenWorkspaceFS(d.workspaceDir, profile.MaxFileBytes)
+	session := d.getSession(sessionID)
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	workspace, err := sandbox.OpenWorkspaceFS(session.workspaceDir, profile.MaxFileBytes)
 	if err != nil {
 		return err
 	}
@@ -689,9 +720,12 @@ func (d *SandboxEngine) WriteFile(_ context.Context, _ string, profile sandbox.P
 	return workspace.WriteFile(relativePath, content)
 }
 
-func (d *SandboxEngine) ReadFile(_ context.Context, _ string, profile sandbox.Profile, relativePath string) ([]byte, error) {
+func (d *SandboxEngine) ReadFile(_ context.Context, sessionID string, profile sandbox.Profile, relativePath string) ([]byte, error) {
 	profile.ApplyDefaults()
-	workspace, err := sandbox.OpenWorkspaceFS(d.workspaceDir, profile.MaxFileBytes)
+	session := d.getSession(sessionID)
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	workspace, err := sandbox.OpenWorkspaceFS(session.workspaceDir, profile.MaxFileBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -699,29 +733,55 @@ func (d *SandboxEngine) ReadFile(_ context.Context, _ string, profile sandbox.Pr
 	return workspace.ReadFile(relativePath)
 }
 
-func (d *SandboxEngine) Reset(_ context.Context, _ string) error { return nil }
+// Reset removes the selected session's container and workspace. For the default
+// session, Reset("") removes everything under the engine's base workspace directory.
+func (d *SandboxEngine) Reset(ctx context.Context, sessionID string) error {
+	session := d.getSession(sessionID)
+	session.mu.Lock()
+	defer session.mu.Unlock()
 
-func (d *SandboxEngine) Close() error {
-	if !d.useLocal {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-
-		// #nosec G204 -- containerName is generated internally by NewSandboxEngine.
-		if err := exec.CommandContext(ctx, "docker", "stop", d.containerName).Run(); err != nil {
-			slog.Debug("docker: stop container failed", "err", err)
+	if session.containerCreated {
+		// #nosec G204 -- containerName is generated internally from an engine nonce and a session hash.
+		if err := exec.CommandContext(ctx, "docker", "rm", "-f", session.containerName).Run(); err != nil {
+			return fmt.Errorf("remove session container %q: %w", session.containerName, err)
 		}
-		// #nosec G204 -- containerName is generated internally by NewSandboxEngine.
-		if err := exec.CommandContext(ctx, "docker", "rm", "-f", d.containerName).Run(); err != nil {
-			slog.Debug("docker: remove container failed", "err", err)
-		}
-		d.mu.Lock()
-		for _, s := range d.activeServers {
-			if err := exec.CommandContext(ctx, "docker", "rm", "-f", s).Run(); err != nil {
-				slog.Debug("docker: remove server container failed", "err", err)
-			}
-		}
-		d.mu.Unlock()
+		session.containerCreated = false
 	}
-
+	if err := os.RemoveAll(session.workspaceDir); err != nil {
+		return fmt.Errorf("remove session workspace: %w", err)
+	}
 	return nil
+}
+
+// Close removes session containers while preserving their workspace files.
+func (d *SandboxEngine) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	d.mu.RLock()
+	sessions := make([]*sandboxSession, 0, len(d.sessions))
+	for _, session := range d.sessions {
+		sessions = append(sessions, session)
+	}
+	servers := append([]string(nil), d.activeServers...)
+	d.mu.RUnlock()
+
+	var closeErr error
+	for _, session := range sessions {
+		session.mu.Lock()
+		if session.containerCreated {
+			// #nosec G204 -- containerName is generated internally from an engine nonce and a session hash.
+			if err := exec.CommandContext(ctx, "docker", "rm", "-f", session.containerName).Run(); err != nil {
+				closeErr = errors.Join(closeErr, fmt.Errorf("remove container %q: %w", session.containerName, err))
+			}
+			session.containerCreated = false
+		}
+		session.mu.Unlock()
+	}
+	for _, server := range servers {
+		if err := exec.CommandContext(ctx, "docker", "rm", "-f", server).Run(); err != nil {
+			closeErr = errors.Join(closeErr, fmt.Errorf("remove server container %q: %w", server, err))
+		}
+	}
+	return closeErr
 }

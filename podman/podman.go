@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,8 +42,10 @@ type ExecRecord struct {
 }
 
 type Config struct {
-	WorkspaceDir       string
-	DefaultImage       string
+	WorkspaceDir string
+	DefaultImage string
+	// Deprecated: retained for source compatibility and ignored. Podman-backed
+	// execution never falls back to running commands on the host.
 	AllowLocalFallback bool
 	EventHandler       func(ExecRecord)
 }
@@ -52,9 +56,16 @@ type SandboxEngine struct {
 	workspaceDir  string
 	defaultImage  string
 	containerName string
-	useLocal      bool
 	runCount      int
 	eventHandler  func(ExecRecord)
+	sessions      map[string]*sandboxSession
+}
+
+type sandboxSession struct {
+	mu               sync.Mutex
+	containerName    string
+	workspaceDir     string
+	containerCreated bool
 }
 
 func NewSandboxEngine(cfg Config) (*SandboxEngine, error) {
@@ -76,14 +87,10 @@ func NewSandboxEngine(cfg Config) (*SandboxEngine, error) {
 		image = "alpine:latest"
 	}
 
-	useLocal := false
 	probeCtx, cancelProbe := context.WithTimeout(context.Background(), podmanProbeTimeout)
 	if _, err := exec.CommandContext(probeCtx, "podman", "version").Output(); err != nil {
-		if !cfg.AllowLocalFallback {
-			cancelProbe()
-			return nil, xerr.Unavailable("podman is missing and local fallback is not allowed", err)
-		}
-		useLocal = true
+		cancelProbe()
+		return nil, xerr.Unavailable("podman is unavailable; host fallback is disabled", err)
 	}
 	cancelProbe()
 
@@ -95,18 +102,16 @@ func NewSandboxEngine(cfg Config) (*SandboxEngine, error) {
 		workspaceDir:  absWorkDir,
 		defaultImage:  image,
 		containerName: containerName,
-		useLocal:      useLocal,
 		eventHandler:  cfg.EventHandler,
+		sessions:      make(map[string]*sandboxSession),
 	}
 
-	if !useLocal {
-		if err := engine.ensureWorkspaceContainer(context.Background()); err != nil {
-			if cfg.AllowLocalFallback {
-				engine.useLocal = true
-			} else {
-				return nil, fmt.Errorf("failed starting podman container: %w", err)
-			}
-		}
+	defaultSession := engine.getSession("")
+	defaultSession.mu.Lock()
+	ensureErr := engine.ensureWorkspaceContainer(context.Background(), defaultSession)
+	defaultSession.mu.Unlock()
+	if ensureErr != nil {
+		return nil, fmt.Errorf("failed starting podman container: %w", ensureErr)
 	}
 
 	return engine, nil
@@ -122,40 +127,81 @@ func NewPodmanSandboxEngine(cfg Config) (*SandboxEngine, error) {
 
 func (p *SandboxEngine) Name() string { return "podman-sandbox-engine" }
 
-func (p *SandboxEngine) ensureWorkspaceContainer(ctx context.Context) error {
+func sessionIDKey(sessionID string) string {
+	if sessionID == "" {
+		return "default"
+	}
+	return sessionID
+}
+
+func sessionDigest(sessionID string) string {
+	sum := sha256.Sum256([]byte(sessionIDKey(sessionID)))
+	return hex.EncodeToString(sum[:])
+}
+
+func (p *SandboxEngine) getSession(sessionID string) *sandboxSession {
+	key := sessionIDKey(sessionID)
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.sessions == nil {
+		p.sessions = make(map[string]*sandboxSession)
+	}
+	if session, ok := p.sessions[key]; ok {
+		return session
+	}
+	containerName := p.containerName
+	if key != "default" {
+		containerName += "-" + sessionDigest(key)
+	}
+	workspaceDir := filepath.Join(p.workspaceDir, ".sessions", sessionDigest(key))
+	if key == "default" {
+		workspaceDir = p.workspaceDir
+	}
+	session := &sandboxSession{
+		containerName: containerName,
+		workspaceDir:  workspaceDir,
+	}
+	p.sessions[key] = session
+	return session
+}
 
-	// #nosec G204 -- containerName is generated internally by NewSandboxEngine.
-	checkCmd := exec.CommandContext(ctx, "podman", "ps", "--filter", "name="+p.containerName, "--format", "{{.Names}}")
+func (p *SandboxEngine) ensureWorkspaceContainer(ctx context.Context, session *sandboxSession) error {
+	if err := os.MkdirAll(session.workspaceDir, 0o755); err != nil {
+		return fmt.Errorf("create session workspace: %w", err)
+	}
+
+	// #nosec G204 -- containerName is generated internally from an engine nonce and a session hash.
+	checkCmd := exec.CommandContext(ctx, "podman", "ps", "--filter", "name="+session.containerName, "--format", "{{.Names}}")
 	out, checkErr := checkCmd.Output()
 	if checkErr != nil {
 		slog.Debug("podman: ps check failed", "err", checkErr)
 	}
-	if strings.Contains(string(out), p.containerName) {
+	if slices.Contains(strings.Fields(string(out)), session.containerName) {
+		session.containerCreated = true
 		return nil
 	}
 
-	// #nosec G204 -- containerName is generated internally by NewSandboxEngine.
-	if err := exec.CommandContext(ctx, "podman", "start", p.containerName).Run(); err == nil {
+	// #nosec G204 -- containerName is generated internally from an engine nonce and a session hash.
+	if err := exec.CommandContext(ctx, "podman", "start", session.containerName).Run(); err == nil {
+		session.containerCreated = true
 		return nil
 	}
 
-	// #nosec G204 -- containerName is generated internally by NewSandboxEngine.
-	if rmErr := exec.CommandContext(ctx, "podman", "rm", "-f", p.containerName).Run(); rmErr != nil {
+	// #nosec G204 -- containerName is generated internally from an engine nonce and a session hash.
+	if rmErr := exec.CommandContext(ctx, "podman", "rm", "-f", session.containerName).Run(); rmErr != nil {
 		slog.Debug("podman: pre-run cleanup failed", "err", rmErr)
 	}
 
 	runArgs := []string{
 		"run", "-d",
-		"--name", p.containerName,
+		"--name", session.containerName,
 		"--memory", "1024m",
 		"--cpus", "2.0",
 		"--pids-limit", "256",
 		"--network", "none",
 		"--read-only",
 		"--security-opt", "no-new-privileges",
-		"-v", p.workspaceDir + ":/workspace:Z",
+		"-v", session.workspaceDir + ":/workspace:Z",
 		"-w", "/workspace",
 		"--tmpfs", "/tmp:rw,exec,nosuid,size=256m",
 		p.defaultImage,
@@ -165,11 +211,12 @@ func (p *SandboxEngine) ensureWorkspaceContainer(ctx context.Context) error {
 	if out, err := exec.CommandContext(ctx, "podman", runArgs...).CombinedOutput(); err != nil {
 		return fmt.Errorf("podman run failed: %w: %s", err, string(out))
 	}
+	session.containerCreated = true
 
 	return nil
 }
 
-func (p *SandboxEngine) applyResourceLimits(ctx context.Context, profile sandbox.Profile) {
+func (p *SandboxEngine) applyResourceLimits(ctx context.Context, containerName string, profile sandbox.Profile) error {
 	args := []string{"update"}
 	if profile.MemoryMB > 0 {
 		args = append(args, "--memory", strconv.Itoa(profile.MemoryMB)+"m")
@@ -180,11 +227,12 @@ func (p *SandboxEngine) applyResourceLimits(ctx context.Context, profile sandbox
 	if profile.PidsLimit > 0 {
 		args = append(args, "--pids-limit", strconv.Itoa(profile.PidsLimit))
 	}
-	args = append(args, p.containerName)
+	args = append(args, containerName)
 
-	if err := exec.CommandContext(ctx, "podman", args...).Run(); err != nil {
-		slog.Debug("podman: update resource limits failed", "err", err)
+	if out, err := exec.CommandContext(ctx, "podman", args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("podman update resource limits: %w: %s", err, strings.TrimSpace(string(out)))
 	}
+	return nil
 }
 
 func (p *SandboxEngine) emit(rec ExecRecord) {
@@ -193,10 +241,14 @@ func (p *SandboxEngine) emit(rec ExecRecord) {
 	}
 }
 
-func (p *SandboxEngine) Run(ctx context.Context, _ string, profile sandbox.Profile, command sandbox.Command) (sandbox.ExecutionResult, error) {
+func (p *SandboxEngine) Run(ctx context.Context, sessionID string, profile sandbox.Profile, command sandbox.Command) (sandbox.ExecutionResult, error) {
 	if len(command.Argv) == 0 {
 		return sandbox.ExecutionResult{ExitCode: 1, Stderr: "empty command"}, nil
 	}
+	profile.ApplyDefaults()
+	session := p.getSession(sessionID)
+	session.mu.Lock()
+	defer session.mu.Unlock()
 
 	imageUsed := profile.Image
 	if imageUsed == "" {
@@ -205,41 +257,31 @@ func (p *SandboxEngine) Run(ctx context.Context, _ string, profile sandbox.Profi
 
 	var cmd *exec.Cmd
 
-	containerLabel := p.containerName
-
-	if p.useLocal {
-		// #nosec G204 -- Executing the supplied argv is this engine's contract; no shell is involved.
-		cmd = exec.CommandContext(ctx, command.Argv[0], command.Argv[1:]...)
-		cmd.Dir = p.workspaceDir
-		if len(command.Env) > 0 {
-			cmd.Env = append(os.Environ(), command.Env...)
-		}
-		containerLabel = "local"
-	} else {
-		if err := p.ensureWorkspaceContainer(ctx); err != nil {
-			return sandbox.ExecutionResult{}, err
-		}
-		p.applyResourceLimits(ctx, profile)
-
-		execArgs := []string{
-			"exec", "-i",
-			"-w", profile.Workspace,
-		}
-
-		if profile.User != "" {
-			execArgs = append(execArgs, "--user", profile.User)
-		}
-
-		for _, e := range command.Env {
-			execArgs = append(execArgs, "-e", e)
-		}
-
-		execArgs = append(execArgs, p.containerName)
-		execArgs = append(execArgs, command.Argv...)
-
-		cmd = exec.CommandContext(ctx, "podman", execArgs...)
+	containerLabel := session.containerName
+	if err := p.ensureWorkspaceContainer(ctx, session); err != nil {
+		return sandbox.ExecutionResult{}, err
+	}
+	if err := p.applyResourceLimits(ctx, session.containerName, profile); err != nil {
+		return sandbox.ExecutionResult{}, err
 	}
 
+	execArgs := []string{
+		"exec", "-i",
+		"-w", profile.Workspace,
+	}
+
+	if profile.User != "" {
+		execArgs = append(execArgs, "--user", profile.User)
+	}
+
+	for _, e := range command.Env {
+		execArgs = append(execArgs, "-e", e)
+	}
+
+	execArgs = append(execArgs, session.containerName)
+	execArgs = append(execArgs, command.Argv...)
+
+	cmd = exec.CommandContext(ctx, "podman", execArgs...)
 	if len(command.Stdin) > 0 {
 		cmd.Stdin = bytes.NewReader(command.Stdin)
 	}
@@ -338,9 +380,12 @@ func drainStream(r io.Reader, buf *bytes.Buffer, emit func(line string)) {
 	}
 }
 
-func (p *SandboxEngine) WriteFile(_ context.Context, _ string, profile sandbox.Profile, relativePath string, content []byte) error {
+func (p *SandboxEngine) WriteFile(_ context.Context, sessionID string, profile sandbox.Profile, relativePath string, content []byte) error {
 	profile.ApplyDefaults()
-	workspace, err := sandbox.OpenWorkspaceFS(p.workspaceDir, profile.MaxFileBytes)
+	session := p.getSession(sessionID)
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	workspace, err := sandbox.OpenWorkspaceFS(session.workspaceDir, profile.MaxFileBytes)
 	if err != nil {
 		return err
 	}
@@ -348,9 +393,12 @@ func (p *SandboxEngine) WriteFile(_ context.Context, _ string, profile sandbox.P
 	return workspace.WriteFile(relativePath, content)
 }
 
-func (p *SandboxEngine) ReadFile(_ context.Context, _ string, profile sandbox.Profile, relativePath string) ([]byte, error) {
+func (p *SandboxEngine) ReadFile(_ context.Context, sessionID string, profile sandbox.Profile, relativePath string) ([]byte, error) {
 	profile.ApplyDefaults()
-	workspace, err := sandbox.OpenWorkspaceFS(p.workspaceDir, profile.MaxFileBytes)
+	session := p.getSession(sessionID)
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	workspace, err := sandbox.OpenWorkspaceFS(session.workspaceDir, profile.MaxFileBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -358,27 +406,49 @@ func (p *SandboxEngine) ReadFile(_ context.Context, _ string, profile sandbox.Pr
 	return workspace.ReadFile(relativePath)
 }
 
-func (p *SandboxEngine) Reset(_ context.Context, _ string) error {
-	files, err := os.ReadDir(p.workspaceDir)
-	if err != nil {
-		return err
-	}
-	for _, f := range files {
-		if rmErr := os.RemoveAll(filepath.Join(p.workspaceDir, f.Name())); rmErr != nil {
-			slog.Debug("podman: workspace cleanup failed", "name", f.Name(), "err", rmErr)
+// Reset removes the selected session's container and workspace. For the default
+// session, Reset("") removes everything under the engine's base workspace directory.
+func (p *SandboxEngine) Reset(ctx context.Context, sessionID string) error {
+	session := p.getSession(sessionID)
+	session.mu.Lock()
+	defer session.mu.Unlock()
+
+	if session.containerCreated {
+		// #nosec G204 -- containerName is generated internally from an engine nonce and a session hash.
+		if err := exec.CommandContext(ctx, "podman", "rm", "-f", session.containerName).Run(); err != nil {
+			return fmt.Errorf("remove session container %q: %w", session.containerName, err)
 		}
+		session.containerCreated = false
+	}
+	if err := os.RemoveAll(session.workspaceDir); err != nil {
+		return fmt.Errorf("remove session workspace: %w", err)
 	}
 	return nil
 }
 
+// Close removes session containers while preserving their workspace files.
 func (p *SandboxEngine) Close() error {
-	if !p.useLocal {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		// #nosec G204 -- containerName is generated internally by NewSandboxEngine.
-		if err := exec.CommandContext(ctx, "podman", "rm", "-f", p.containerName).Run(); err != nil {
-			slog.Debug("podman: remove container failed", "err", err)
-		}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	p.mu.RLock()
+	sessions := make([]*sandboxSession, 0, len(p.sessions))
+	for _, session := range p.sessions {
+		sessions = append(sessions, session)
 	}
-	return nil
+	p.mu.RUnlock()
+
+	var closeErr error
+	for _, session := range sessions {
+		session.mu.Lock()
+		if session.containerCreated {
+			// #nosec G204 -- containerName is generated internally from an engine nonce and a session hash.
+			if err := exec.CommandContext(ctx, "podman", "rm", "-f", session.containerName).Run(); err != nil {
+				closeErr = errors.Join(closeErr, fmt.Errorf("remove container %q: %w", session.containerName, err))
+			}
+			session.containerCreated = false
+		}
+		session.mu.Unlock()
+	}
+	return closeErr
 }

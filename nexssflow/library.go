@@ -30,8 +30,8 @@ type GlobalOptions struct {
 	CacheMaxMB         int64  `nflow:"cache_max_mb" default:"5120"`
 	NoCache            bool   `nflow:"no_cache"`
 
-	// AllowLocalFallback permits the docker/podman engines to fall back
-	// to host execution when the runtime is unavailable.
+	// Deprecated: retained for configuration compatibility and ignored. The
+	// docker/podman engines fail closed when their runtime is unavailable.
 	AllowLocalFallback bool `nflow:"allow_local_fallback"`
 
 	// EnforcePolicy enables the static policy. Default true.
@@ -97,18 +97,16 @@ func buildEngine(global GlobalOptions) (sandbox.Engine, error) {
 	switch global.Engine {
 	case "", "docker":
 		return docker.NewSandboxEngine(docker.Config{
-			WorkspaceDir:       global.Workspace,
-			DefaultImage:       global.Image,
-			AllowLocalFallback: global.AllowLocalFallback,
-			CacheDir:           global.CacheDir,
-			CacheMaxBytes:      global.CacheMaxMB << 20,
-			DisableCache:       global.NoCache,
+			WorkspaceDir:  global.Workspace,
+			DefaultImage:  global.Image,
+			CacheDir:      global.CacheDir,
+			CacheMaxBytes: global.CacheMaxMB << 20,
+			DisableCache:  global.NoCache,
 		})
 	case "podman":
 		return podman.NewSandboxEngine(podman.Config{
-			WorkspaceDir:       global.Workspace,
-			DefaultImage:       global.Image,
-			AllowLocalFallback: global.AllowLocalFallback,
+			WorkspaceDir: global.Workspace,
+			DefaultImage: global.Image,
 		})
 	case "inprocess":
 		return sandbox.NewInProcessEngine(global.Workspace), nil

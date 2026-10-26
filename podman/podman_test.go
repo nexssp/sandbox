@@ -54,14 +54,17 @@ func TestWorkspaceFileOperationsRejectSymlinkEscape(t *testing.T) {
 	if err := os.WriteFile(secretPath, []byte("secret"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(outside, filepath.Join(root, "escape")); err != nil {
-		t.Skipf("symlinks unavailable: %v", err)
-	}
-
 	// Current engine type is SandboxEngine; the NewPodmanSandboxEngine
 	// constructor remains as a deprecated alias, but tests exercise the
 	// current API directly.
 	engine := &SandboxEngine{workspaceDir: root}
+	root = engine.getSession("").workspaceDir
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "escape")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
 	profile := sandbox.Profile{MaxFileBytes: 1024}
 	ctx := context.Background()
 	if err := engine.WriteFile(ctx, "", profile, "escape/pwned.txt", []byte("no")); err == nil {
