@@ -308,7 +308,10 @@ func buildConfig(t *testing.T, src string, extraBundles ...compiler.Bundle) runn
 		t.Fatalf("preprocess: %v", err)
 	}
 
-	reqs := require.FromMeta(meta)
+	reqs, err := require.FromMeta(meta)
+	if err != nil {
+		t.Fatalf("requirements: %v", err)
+	}
 	if len(reqs) == 0 {
 		t.Fatal("no @require declarations parsed")
 	}

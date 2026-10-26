@@ -154,9 +154,21 @@ The result includes `exit_code`, `stdout`, `stderr`, `duration`, `truncated`, an
 
 Host-side workspace reads and writes use `WorkspaceFS` backed by Go's `os.Root`, confining paths and installing writes atomically. Flow `sandbox.exec` accepts `files` as a map from workspace-relative destination paths to typed `xfile.Ref` values (`nexssflow.BlobRef` is an alias); it does not take inline file contents as file references. Provider and object IDs are opaque and are never interpreted as local paths.
 
-File references remain fail-closed unless the host explicitly supplies an authorized `xfile.Resolver`, for example with `nexssflow.BundleWithFileResolver`. The adapter checks caller/tenant scope, validates the provider/object identity returned by the resolver, and checks any requested version, size, and SHA-256 digest. It bounds each file by `MaxFileBytes`, stages and verifies resolved content before installing it into the workspace, and rejects invalid destinations. The standard `@require` bundle does not automatically connect Storage providers; without a resolver, requests containing file references return unavailable.
+File references remain fail-closed unless the host explicitly supplies an authorized `xfile.Resolver`. Storage's `BlobStore` implements that resolver contract; the host can add the provider binding to its Flow bundle set before building the runner configuration:
 
-> **WIP — automatic file-provider wiring:** `BundleWithFileResolver` supports a host-injected resolver, but ordinary `@require` does not yet connect Storage providers automatically. File references fail closed until the host supplies an authorized resolver.
+```go
+storageFiles := storageflow.WithBlobStoreFileResolver(
+    compiler.Bundle{ID: "app.storage-files"},
+    ref.Provider, // provider from a trusted Storage-generated reference
+    blobs,
+)
+bundles = append(bundles, storageFiles) // bundles also includes Sandbox and normal app bundles
+cfg, err := runner.BuildConfig(bundles)
+```
+
+The standard `@require` Sandbox bundle remains unchanged and does not discover or enable Storage automatically. This explicit provider-scoped binding makes the selected BlobStore available to Sandbox's existing request-context resolver; each `Open` is still authorized by Storage using the authenticated caller and tenant. A reference is not a capability. The binding applies to references for the provider, not just one object, so avoid registering multiple stores with the same provider unless their resolution order is intentional. Without a binding, file references continue to fail closed with unavailable.
+
+Sandbox validates the destination path and resolver identity, checks any expected version, size, and SHA-256 digest, enforces `MaxFileBytes`, stages and verifies resolved content, and only then installs it into the execution workspace. Keep the static profile/command policy enabled for untrusted inputs and use a real isolated engine; the in-process engine is not an isolation boundary.
 
 Runnable ecosystem examples now live in the [Nexss examples repository](https://github.com/nexssp/examples).
 
