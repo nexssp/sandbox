@@ -2,33 +2,89 @@ package docker
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/nexssp/sandbox"
 )
 
+const dockerStubEnv = "NEXSS_SANDBOX_TEST_DOCKER_STUB"
+
+func TestMain(m *testing.M) {
+	if os.Getenv(dockerStubEnv) == "1" {
+		os.Exit(runDockerStub(os.Args[1:]))
+	}
+	os.Exit(m.Run())
+}
+
+func runDockerStub(args []string) int {
+	if logPath := os.Getenv("SANDBOX_RUNTIME_LOG"); logPath != "" {
+		log, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600) // #nosec G703 -- Test log path is assigned from t.TempDir by installDockerStub.
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 2
+		}
+		if _, err := fmt.Fprintln(log, strings.Join(args, " ")); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			_ = log.Close()
+			return 2
+		}
+		if err := log.Close(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 2
+		}
+	}
+
+	if len(args) == 0 {
+		return 0
+	}
+	switch args[0] {
+	case "version":
+		if os.Getenv("SANDBOX_FAIL_VERSION") == "1" {
+			return 42
+		}
+	case "ps":
+		for _, arg := range args[1:] {
+			if name, ok := strings.CutPrefix(arg, "name="); ok {
+				fmt.Println(name)
+			}
+		}
+	case "update":
+		if os.Getenv("SANDBOX_FAIL_UPDATE") == "1" {
+			fmt.Fprintln(os.Stderr, "resource-update-failed")
+			return 42
+		}
+	case "exec":
+		fmt.Println("executed")
+	}
+	return 0
+}
+
 func installDockerStub(t *testing.T) string {
 	t.Helper()
 	binDir := t.TempDir()
 	logPath := filepath.Join(t.TempDir(), "docker.log")
-	script := `#!/bin/sh
-printf '%s\n' "$*" >> "$SANDBOX_RUNTIME_LOG"
-case "$1" in
-  version) [ "${SANDBOX_FAIL_VERSION:-0}" != 1 ] || exit 42 ;;
-  ps) for arg in "$@"; do case "$arg" in name=*) printf '%s\n' "${arg#name=}" ;; esac; done ;;
-  update) [ "${SANDBOX_FAIL_UPDATE:-0}" != 1 ] || { echo resource-update-failed >&2; exit 42; } ;;
-  exec) echo executed ;;
-  run|start|rm|stop) ;;
-esac
-exit 0
-`
-	if err := os.WriteFile(filepath.Join(binDir, "docker"), []byte(script), 0o700); err != nil { // #nosec G306 -- Test runtime stub must be executable by its owner.
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary, err := os.ReadFile(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stubName := "docker"
+	if runtime.GOOS == "windows" {
+		stubName += ".exe"
+	}
+	if err := os.WriteFile(filepath.Join(binDir, stubName), binary, 0o700); err != nil { // #nosec G306,G703 -- Test runtime stub is a copy of the test binary under t.TempDir.
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(dockerStubEnv, "1")
 	t.Setenv("SANDBOX_RUNTIME_LOG", logPath)
 	return logPath
 }

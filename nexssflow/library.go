@@ -5,6 +5,7 @@ import (
 
 	"github.com/nexssp/flow/compiler"
 	"github.com/nexssp/kernel/action"
+	"github.com/nexssp/kernel/xerr"
 	"github.com/nexssp/kernel/xfile"
 
 	"github.com/nexssp/sandbox"
@@ -67,7 +68,17 @@ func BundleWithFileResolver(raw map[string]string, resolver xfile.Resolver) comp
 
 	engine, err := buildEngine(global)
 	if err != nil {
-		panic("sandbox bundle: " + err.Error())
+		if xerr.KindFrom(err) != xerr.KindUnavailable {
+			panic("sandbox bundle: " + err.Error())
+		}
+		engineName := global.Engine
+		if engineName == "" {
+			engineName = "docker"
+		}
+		engine = unavailableEngine{
+			name: engineName + "-sandbox-engine",
+			err:  unavailableStartupError(engineName, err),
+		}
 	}
 
 	var policy sandbox.Policy = sandbox.StaticPolicy{}

@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -190,8 +192,8 @@ func TestSandboxBundle_EndToEnd_RequiresExplicitFileResolver(t *testing.T) {
 @sandbox runner { image: "alpine:latest" }
 
 {
-  command: "cat",
-  args: ["hello.txt"],
+  command: "go",
+  args: ["version"],
   files: { "hello.txt": { Provider: "test-store", ID: "hello" } }
 } -> sandbox.runner
 `
@@ -210,6 +212,27 @@ func TestSandboxBundle_EndToEnd_StagesStaticEmbedAndStorageRef(t *testing.T) {
 	storagePayload := []byte("storage blob payload\n")
 	storageSum := sha256.Sum256(storagePayload)
 	storageDigest := "sha256:" + hex.EncodeToString(storageSum[:])
+	workspaceDir := t.TempDir()
+	readerPath := filepath.Join(workspaceDir, "read_files.go")
+	// This small Go helper reads staged files without relying on a Unix `cat` command.
+	readerSource := `package main
+
+import "os"
+
+func main() {
+	for _, name := range os.Args[1:] {
+		data, err := os.ReadFile(name)
+		if err != nil {
+			panic(err)
+		}
+		if _, err := os.Stdout.Write(data); err != nil {
+			panic(err)
+		}
+	}
+}`
+	if err := os.WriteFile(readerPath, []byte(readerSource), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	embedBundle, embedResolver := embedext.BundleWithFileResolver(fstest.MapFS{
 		"assets/logo.txt": &fstest.MapFile{Data: staticPayload},
@@ -245,8 +268,8 @@ func TestSandboxBundle_EndToEnd_StagesStaticEmbedAndStorageRef(t *testing.T) {
 @embed logo "assets/logo.txt"
 
 sb.exec @{
-  command: "cat",
-  args: ["static", "storage"],
+  command: "go",
+  args: ["run", %q, "static", "storage"],
   files: {
     static: embed.logo,
     storage: {
@@ -258,7 +281,7 @@ sb.exec @{
     }
   }
 }
-`, t.TempDir(), storageRef.Provider, storageRef.ID, storageRef.Version, storageRef.ExpectedSize, storageRef.ExpectedDigest)
+`, workspaceDir, readerPath, storageRef.Provider, storageRef.ID, storageRef.Version, storageRef.ExpectedSize, storageRef.ExpectedDigest)
 	cfg := buildConfig(t, src, embedBundle, storageBundle)
 	ctx := xctx.WithUserID(t.Context(), "e2e-caller")
 	ctx = xctx.WithTenantID(ctx, "e2e-tenant")
