@@ -29,11 +29,10 @@ jobs:
           version: 3.x
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      # Fast binary install (~2s), isolates linter dependencies from go.mod
       - name: Install golangci-lint
-        uses: golangci/golangci-lint-action@v9.3.0
+        uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.14.0
+          version: latest
           install-only: true
 
       - name: Verify go.mod and go.sum are tidy
