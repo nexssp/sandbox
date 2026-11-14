@@ -159,6 +159,34 @@ func TestSessionWorkspacesAndResetAreIsolated(t *testing.T) {
 	}
 }
 
+func TestRunEnablesDockerStdinWhenInputProvided(t *testing.T) {
+	logPath := installDockerStub(t)
+	engine := &SandboxEngine{
+		workspaceDir:  t.TempDir(),
+		defaultImage:  "test-image",
+		containerName: "engine-test",
+	}
+
+	_, err := engine.Run(context.Background(), "stdin-test", sandbox.Profile{}, sandbox.Command{
+		Argv:  []string{"wc", "-w"},
+		Stdin: []byte("capital of poland"),
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	log, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(log), "exec -i -w") {
+		t.Fatalf("Docker exec did not enable stdin: %s", log)
+	}
+	if strings.Contains(string(log), "exec -i=false") {
+		t.Fatalf("Docker exec disabled stdin despite receiving input: %s", log)
+	}
+}
+
 func TestAllowLocalFallbackDoesNotRunHostCommand(t *testing.T) {
 	installDockerStub(t)
 	t.Setenv("SANDBOX_FAIL_VERSION", "1")

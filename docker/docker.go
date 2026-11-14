@@ -580,12 +580,17 @@ func (d *SandboxEngine) Run(ctx context.Context, sessionID string, profile sandb
 		return sandbox.ExecutionResult{}, err
 	}
 
-	execArgs := []string{
-		"exec", "-i=false",
+	execArgs := []string{"exec"}
+	if len(command.Stdin) > 0 {
+		execArgs = append(execArgs, "-i")
+	} else {
+		execArgs = append(execArgs, "-i=false")
+	}
+	execArgs = append(execArgs,
 		"-w", profile.Workspace,
 		"-e", "DEBIAN_FRONTEND=noninteractive",
 		"-e", "DEBCONF_NOWARNINGS=yes",
-	}
+	)
 
 	if profile.User != "" {
 		execArgs = append(execArgs, "--user", profile.User)
