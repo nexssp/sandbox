@@ -23,6 +23,7 @@ import (
 	"github.com/nexssp/kernel/xerr"
 
 	"github.com/nexssp/sandbox"
+	"github.com/nexssp/sandbox/internal/runtimecleanup"
 )
 
 const podmanProbeTimeout = 5 * time.Second
@@ -48,10 +49,13 @@ type Config struct {
 	// execution never falls back to running commands on the host.
 	AllowLocalFallback bool
 	EventHandler       func(ExecRecord)
+	StaleContainerAge  time.Duration // zero = 24 hours; negative is invalid
 }
 
 // SandboxEngine is the podman-backed implementation of sandbox.Engine.
 type SandboxEngine struct {
+	lifecycleMu   sync.RWMutex
+	closed        bool
 	mu            sync.RWMutex
 	workspaceDir  string
 	defaultImage  string
@@ -66,9 +70,16 @@ type sandboxSession struct {
 	containerName    string
 	workspaceDir     string
 	containerCreated bool
+	lease            *runtimecleanup.Lease
 }
 
 func NewSandboxEngine(cfg Config) (*SandboxEngine, error) {
+	if cfg.StaleContainerAge < 0 {
+		return nil, xerr.BadRequest("stale container age must not be negative")
+	}
+	if cfg.StaleContainerAge == 0 {
+		cfg.StaleContainerAge = runtimecleanup.DefaultStaleContainerAge
+	}
 	if cfg.WorkspaceDir == "" {
 		cfg.WorkspaceDir = ".nexss_workspace"
 	}
@@ -93,6 +104,11 @@ func NewSandboxEngine(cfg Config) (*SandboxEngine, error) {
 		return nil, xerr.Unavailable("podman is unavailable; host fallback is disabled", err)
 	}
 	cancelProbe()
+	cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), podmanProbeTimeout)
+	if err := runtimecleanup.PruneStale(cleanupCtx, "podman", absWorkDir, cfg.StaleContainerAge); err != nil {
+		slog.Warn("podman: stale-container cleanup failed; continuing startup", "error", err)
+	}
+	cancelCleanup()
 
 	var b [4]byte
 	_, _ = rand.Read(b[:])
@@ -111,7 +127,8 @@ func NewSandboxEngine(cfg Config) (*SandboxEngine, error) {
 	ensureErr := engine.ensureWorkspaceContainer(context.Background(), defaultSession)
 	defaultSession.mu.Unlock()
 	if ensureErr != nil {
-		return nil, fmt.Errorf("failed starting podman container: %w", ensureErr)
+		closeErr := engine.Close()
+		return nil, errors.Join(fmt.Errorf("failed starting podman container: %w", ensureErr), closeErr)
 	}
 
 	return engine, nil
@@ -126,6 +143,15 @@ func NewPodmanSandboxEngine(cfg Config) (*SandboxEngine, error) {
 }
 
 func (p *SandboxEngine) Name() string { return "podman-sandbox-engine" }
+
+func (p *SandboxEngine) beginOperation() (func(), error) {
+	p.lifecycleMu.RLock()
+	if p.closed {
+		p.lifecycleMu.RUnlock()
+		return nil, xerr.Shutdown("podman sandbox engine is closed")
+	}
+	return p.lifecycleMu.RUnlock, nil
+}
 
 func sessionIDKey(sessionID string) string {
 	if sessionID == "" {
@@ -166,6 +192,13 @@ func (p *SandboxEngine) getSession(sessionID string) *sandboxSession {
 }
 
 func (p *SandboxEngine) ensureWorkspaceContainer(ctx context.Context, session *sandboxSession) error {
+	if session.lease == nil {
+		lease, err := runtimecleanup.Acquire(session.containerName)
+		if err != nil {
+			return fmt.Errorf("acquire container lease %q: %w", session.containerName, err)
+		}
+		session.lease = lease
+	}
 	if err := os.MkdirAll(session.workspaceDir, 0o755); err != nil {
 		return fmt.Errorf("create session workspace: %w", err)
 	}
@@ -192,21 +225,28 @@ func (p *SandboxEngine) ensureWorkspaceContainer(ctx context.Context, session *s
 		slog.Debug("podman: pre-run cleanup failed", "err", rmErr)
 	}
 
+	labels, err := runtimecleanup.LabelArgs(p.workspaceDir, session.containerName)
+	if err != nil {
+		return fmt.Errorf("prepare container ownership labels: %w", err)
+	}
 	runArgs := []string{
 		"run", "-d",
 		"--name", session.containerName,
+	}
+	runArgs = append(runArgs, labels...)
+	runArgs = append(runArgs,
 		"--memory", "1024m",
 		"--cpus", "2.0",
 		"--pids-limit", "256",
 		"--network", "none",
 		"--read-only",
 		"--security-opt", "no-new-privileges",
-		"-v", session.workspaceDir + ":/workspace:Z",
+		"-v", session.workspaceDir+":/workspace:Z",
 		"-w", "/workspace",
 		"--tmpfs", "/tmp:rw,exec,nosuid,size=256m",
 		p.defaultImage,
 		"sleep", "infinity",
-	}
+	)
 
 	if out, err := exec.CommandContext(ctx, "podman", runArgs...).CombinedOutput(); err != nil {
 		return fmt.Errorf("podman run failed: %w: %s", err, string(out))
@@ -242,6 +282,12 @@ func (p *SandboxEngine) emit(rec ExecRecord) {
 }
 
 func (p *SandboxEngine) Run(ctx context.Context, sessionID string, profile sandbox.Profile, command sandbox.Command) (sandbox.ExecutionResult, error) {
+	release, startErr := p.beginOperation()
+	if startErr != nil {
+		return sandbox.ExecutionResult{}, startErr
+	}
+	defer release()
+
 	if len(command.Argv) == 0 {
 		return sandbox.ExecutionResult{ExitCode: 1, Stderr: "empty command"}, nil
 	}
@@ -381,6 +427,12 @@ func drainStream(r io.Reader, buf *bytes.Buffer, emit func(line string)) {
 }
 
 func (p *SandboxEngine) WriteFile(_ context.Context, sessionID string, profile sandbox.Profile, relativePath string, content []byte) error {
+	release, startErr := p.beginOperation()
+	if startErr != nil {
+		return startErr
+	}
+	defer release()
+
 	profile.ApplyDefaults()
 	session := p.getSession(sessionID)
 	session.mu.Lock()
@@ -394,6 +446,12 @@ func (p *SandboxEngine) WriteFile(_ context.Context, sessionID string, profile s
 }
 
 func (p *SandboxEngine) ReadFile(_ context.Context, sessionID string, profile sandbox.Profile, relativePath string) ([]byte, error) {
+	release, startErr := p.beginOperation()
+	if startErr != nil {
+		return nil, startErr
+	}
+	defer release()
+
 	profile.ApplyDefaults()
 	session := p.getSession(sessionID)
 	session.mu.Lock()
@@ -409,6 +467,12 @@ func (p *SandboxEngine) ReadFile(_ context.Context, sessionID string, profile sa
 // Reset removes the selected session's container and workspace. For the default
 // session, Reset("") removes everything under the engine's base workspace directory.
 func (p *SandboxEngine) Reset(ctx context.Context, sessionID string) error {
+	release, startErr := p.beginOperation()
+	if startErr != nil {
+		return startErr
+	}
+	defer release()
+
 	session := p.getSession(sessionID)
 	session.mu.Lock()
 	defer session.mu.Unlock()
@@ -426,10 +490,20 @@ func (p *SandboxEngine) Reset(ctx context.Context, sessionID string) error {
 	return nil
 }
 
-// Close removes session containers while preserving their workspace files.
+// Close permanently shuts down the engine, removes session containers, and
+// preserves their workspace files. It is safe to call repeatedly.
 func (p *SandboxEngine) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	return p.CloseContext(ctx)
+}
+
+// CloseContext permanently shuts down the engine, removes session containers,
+// and preserves their workspace files. It is safe to call repeatedly.
+func (p *SandboxEngine) CloseContext(ctx context.Context) error {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	p.closed = true
 
 	p.mu.RLock()
 	sessions := make([]*sandboxSession, 0, len(p.sessions))
@@ -445,8 +519,15 @@ func (p *SandboxEngine) Close() error {
 			// #nosec G204 -- containerName is generated internally from an engine nonce and a session hash.
 			if err := exec.CommandContext(ctx, "podman", "rm", "-f", session.containerName).Run(); err != nil {
 				closeErr = errors.Join(closeErr, fmt.Errorf("remove container %q: %w", session.containerName, err))
+			} else {
+				session.containerCreated = false
 			}
-			session.containerCreated = false
+		}
+		if session.lease != nil {
+			if err := session.lease.Close(); err != nil {
+				closeErr = errors.Join(closeErr, fmt.Errorf("release container lease %q: %w", session.containerName, err))
+			}
+			session.lease = nil
 		}
 		session.mu.Unlock()
 	}

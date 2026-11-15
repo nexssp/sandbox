@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/nexssp/kernel/xerr"
+
 	"github.com/nexssp/sandbox"
 )
 
@@ -47,11 +49,23 @@ func runDockerStub(args []string) int {
 		if os.Getenv("SANDBOX_FAIL_VERSION") == "1" {
 			return 42
 		}
+	case "context":
+		if len(args) > 1 && args[1] == "show" {
+			fmt.Println("default")
+		} else if len(args) > 1 && args[1] == "inspect" {
+			fmt.Print(`[{"Endpoints":{"docker":{"Host":"unix:///var/run/docker.sock"}}}]`)
+		}
 	case "ps":
 		for _, arg := range args[1:] {
 			if name, ok := strings.CutPrefix(arg, "name="); ok {
-				fmt.Println(name)
+				if os.Getenv("SANDBOX_FORCE_CREATE") != "1" {
+					fmt.Println(name)
+				}
 			}
+		}
+	case "start":
+		if os.Getenv("SANDBOX_FORCE_CREATE") == "1" {
+			return 42
 		}
 	case "update":
 		if os.Getenv("SANDBOX_FAIL_UPDATE") == "1" {
@@ -85,6 +99,8 @@ func installDockerStub(t *testing.T) string {
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv(dockerStubEnv, "1")
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
 	t.Setenv("SANDBOX_RUNTIME_LOG", logPath)
 	return logPath
 }
@@ -156,6 +172,45 @@ func TestSessionWorkspacesAndResetAreIsolated(t *testing.T) {
 	}
 	if strings.Contains(string(log), "rm -f "+beta.containerName) {
 		t.Fatalf("reset of alpha removed beta's container: %s", log)
+	}
+}
+
+func TestCreatedContainerIsLabeledAndClosePreservesWorkspace(t *testing.T) {
+	logPath := installDockerStub(t)
+	t.Setenv("SANDBOX_FORCE_CREATE", "1")
+	workspace := t.TempDir()
+	marker := filepath.Join(workspace, "keep.txt")
+	if err := os.WriteFile(marker, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	engine, err := NewSandboxEngine(Config{
+		WorkspaceDir: workspace,
+		DefaultImage: "test-image",
+		DisableCache: true,
+	})
+	if err != nil {
+		t.Fatalf("NewSandboxEngine: %v", err)
+	}
+	if err := engine.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	log, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, label := range []string{
+		"io.nexss.sandbox.managed=true",
+		"io.nexss.sandbox.workspace=",
+		"io.nexss.sandbox.host=",
+		"io.nexss.sandbox.owner=",
+		"io.nexss.sandbox.lease=" + engine.containerName,
+	} {
+		if !strings.Contains(string(log), "--label "+label) {
+			t.Errorf("container run did not include label %q: %s", label, log)
+		}
+	}
+	if got, err := os.ReadFile(marker); err != nil || string(got) != "keep" {
+		t.Fatalf("workspace marker = %q, error = %v; want preserved data", got, err)
 	}
 }
 
@@ -251,5 +306,26 @@ func TestCloseRemovesAllSessionContainersAndPreservesWorkspaces(t *testing.T) {
 		if err != nil || string(got) != session.containerName {
 			t.Errorf("Close() did not preserve workspace file for %q: contents=%q, error=%v", session.containerName, got, err)
 		}
+	}
+}
+
+func TestClosedEngineRejectsOperations(t *testing.T) {
+	logPath := installDockerStub(t)
+	engine := &SandboxEngine{workspaceDir: t.TempDir(), containerName: "closed-engine"}
+	if err := engine.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := engine.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+
+	if _, err := engine.Run(t.Context(), "", sandbox.Profile{}, sandbox.Command{Argv: []string{"true"}}); xerr.KindFrom(err) != xerr.KindShutdown {
+		t.Fatalf("Run after Close error kind = %q, want %q (err %v)", xerr.KindFrom(err), xerr.KindShutdown, err)
+	}
+	if err := engine.WriteFile(t.Context(), "", sandbox.Profile{}, "marker.txt", []byte("no")); xerr.KindFrom(err) != xerr.KindShutdown {
+		t.Fatalf("WriteFile after Close error kind = %q, want %q (err %v)", xerr.KindFrom(err), xerr.KindShutdown, err)
+	}
+	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
+		t.Fatalf("runtime was invoked after Close; stat err = %v", err)
 	}
 }

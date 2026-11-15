@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/nexssp/kernel/xerr"
+
 	"github.com/nexssp/sandbox"
 )
 
@@ -44,6 +46,13 @@ func TestProfile_FieldsAreHonoured(t *testing.T) {
 	}
 	if !p.ReadOnlyRootFS {
 		t.Fatal("ReadOnlyRootFS = false, want true")
+	}
+}
+
+func TestNewSandboxEngineRejectsNegativeStaleContainerAge(t *testing.T) {
+	_, err := NewSandboxEngine(Config{StaleContainerAge: -1})
+	if got := xerr.KindFrom(err); got != xerr.KindBadRequest {
+		t.Fatalf("error kind = %q, want %q (err %v)", got, xerr.KindBadRequest, err)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"github.com/nexssp/flow/compiler"
 	"github.com/nexssp/flow/native"
 	"github.com/nexssp/flow/runner"
+	"github.com/nexssp/kernel/xerr"
 )
 
 func TestBundle_MockEngine(t *testing.T) {
@@ -135,6 +136,24 @@ func TestBundle_RejectsUnknownEngine(t *testing.T) {
 		}
 	}()
 	Bundle(map[string]string{"engine": "quantum"})
+}
+
+func TestBundle_NegativeStaleContainerAgeIsClassified(t *testing.T) {
+	global := GlobalOptions{Engine: "docker", StaleContainerAge: -1}
+	engine, err := buildEngine(global)
+	if got := xerr.KindFrom(err); got != xerr.KindBadRequest {
+		t.Fatalf("error kind = %q, want %q (err %v)", got, xerr.KindBadRequest, err)
+	}
+	if engine != nil {
+		t.Fatal("buildEngine returned an engine for invalid stale-container age")
+	}
+
+	// Bundle factories cannot return an error, so classified configuration
+	// failures are retained by the action-boundary engine instead of panicking.
+	bundle := Bundle(map[string]string{"engine": "docker", "stale_container_age": "-1s"})
+	if bundle.ID != ID || len(bundle.Libraries) != 1 {
+		t.Fatalf("invalid-config bundle was not constructed safely: %+v", bundle)
+	}
 }
 
 func TestHandleSandbox_RejectsMissingImage(t *testing.T) {

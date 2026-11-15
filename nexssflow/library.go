@@ -2,6 +2,7 @@ package nexssflow
 
 import (
 	"embed"
+	"time"
 
 	"github.com/nexssp/flow/compiler"
 	"github.com/nexssp/kernel/action"
@@ -22,14 +23,15 @@ func init() {
 }
 
 type GlobalOptions struct {
-	Engine             string `nflow:"engine"       default:"docker"`
-	Workspace          string `nflow:"workspace"    default:".sandbox"`
-	Image              string `nflow:"image"`
-	AllowedExecutables string `nflow:"allowed_executables"`
-	AllowedEnvKeys     string `nflow:"allowed_env_keys"`
-	CacheDir           string `nflow:"cache_dir"`
-	CacheMaxMB         int64  `nflow:"cache_max_mb" default:"5120"`
-	NoCache            bool   `nflow:"no_cache"`
+	Engine             string        `nflow:"engine"       default:"docker"`
+	Workspace          string        `nflow:"workspace"    default:".sandbox"`
+	Image              string        `nflow:"image"`
+	AllowedExecutables string        `nflow:"allowed_executables"`
+	AllowedEnvKeys     string        `nflow:"allowed_env_keys"`
+	CacheDir           string        `nflow:"cache_dir"`
+	CacheMaxMB         int64         `nflow:"cache_max_mb" default:"5120"`
+	NoCache            bool          `nflow:"no_cache"`
+	StaleContainerAge  time.Duration `nflow:"stale_container_age" default:"24h"`
 
 	// Deprecated: retained for configuration compatibility and ignored. The
 	// docker/podman engines fail closed when their runtime is unavailable.
@@ -68,16 +70,21 @@ func BundleWithFileResolver(raw map[string]string, resolver xfile.Resolver) comp
 
 	engine, err := buildEngine(global)
 	if err != nil {
-		if xerr.KindFrom(err) != xerr.KindUnavailable {
+		kind := xerr.KindFrom(err)
+		if kind != xerr.KindUnavailable && kind != xerr.KindBadRequest {
 			panic("sandbox bundle: " + err.Error())
 		}
 		engineName := global.Engine
 		if engineName == "" {
 			engineName = "docker"
 		}
-		engine = unavailableEngine{
+		engineError := err
+		if kind == xerr.KindUnavailable {
+			engineError = unavailableStartupError(engineName, err)
+		}
+		engine = startupErrorEngine{
 			name: engineName + "-sandbox-engine",
-			err:  unavailableStartupError(engineName, err),
+			err:  engineError,
 		}
 	}
 
@@ -99,6 +106,7 @@ func BundleWithFileResolver(raw map[string]string, resolver xfile.Resolver) comp
 		Libraries:   []action.Library{lib},
 		Directives:  []compiler.Directive{newSandboxDirective()},
 		Materialize: materialize(engine, policy, resolver),
+		Shutdowns:   []compiler.ShutdownFunc{engineShutdown(engine)},
 		SelfTest:    selftest,
 		Fixtures:    fixturesFS,
 	}
@@ -107,18 +115,28 @@ func BundleWithFileResolver(raw map[string]string, resolver xfile.Resolver) comp
 func buildEngine(global GlobalOptions) (sandbox.Engine, error) {
 	switch global.Engine {
 	case "", "docker":
-		return docker.NewSandboxEngine(docker.Config{
-			WorkspaceDir:  global.Workspace,
-			DefaultImage:  global.Image,
-			CacheDir:      global.CacheDir,
-			CacheMaxBytes: global.CacheMaxMB << 20,
-			DisableCache:  global.NoCache,
+		engine, err := docker.NewSandboxEngine(docker.Config{
+			WorkspaceDir:      global.Workspace,
+			DefaultImage:      global.Image,
+			CacheDir:          global.CacheDir,
+			CacheMaxBytes:     global.CacheMaxMB << 20,
+			DisableCache:      global.NoCache,
+			StaleContainerAge: global.StaleContainerAge,
 		})
+		if err != nil {
+			return nil, err
+		}
+		return engine, nil
 	case "podman":
-		return podman.NewSandboxEngine(podman.Config{
-			WorkspaceDir: global.Workspace,
-			DefaultImage: global.Image,
+		engine, err := podman.NewSandboxEngine(podman.Config{
+			WorkspaceDir:      global.Workspace,
+			DefaultImage:      global.Image,
+			StaleContainerAge: global.StaleContainerAge,
 		})
+		if err != nil {
+			return nil, err
+		}
+		return engine, nil
 	case "inprocess":
 		return sandbox.NewInProcessEngine(global.Workspace), nil
 	case "mock":

@@ -23,6 +23,7 @@ import (
 	"github.com/nexssp/kernel/xerr"
 
 	"github.com/nexssp/sandbox"
+	"github.com/nexssp/sandbox/internal/runtimecleanup"
 )
 
 const defaultOutputLimit = 1 << 20
@@ -74,13 +75,16 @@ type Config struct {
 	AllowLocalFallback bool
 	EventHandler       func(ExecRecord)
 
-	CacheDir      string // empty = default under WorkspaceDir
-	CacheMaxBytes int64  // <=0 = 5 GiB
-	DisableCache  bool   // skip docker commit/save caching
+	CacheDir          string        // empty = default under WorkspaceDir
+	CacheMaxBytes     int64         // <=0 = 5 GiB
+	DisableCache      bool          // skip docker commit/save caching
+	StaleContainerAge time.Duration // zero = 24 hours; negative is invalid
 }
 
 // SandboxEngine is the docker-backed implementation of sandbox.Engine.
 type SandboxEngine struct {
+	lifecycleMu   sync.RWMutex
+	closed        bool
 	mu            sync.RWMutex
 	workspaceDir  string
 	defaultImage  string
@@ -97,9 +101,16 @@ type sandboxSession struct {
 	containerName    string
 	workspaceDir     string
 	containerCreated bool
+	lease            *runtimecleanup.Lease
 }
 
 func NewSandboxEngine(cfg Config) (*SandboxEngine, error) {
+	if cfg.StaleContainerAge < 0 {
+		return nil, xerr.BadRequest("stale container age must not be negative")
+	}
+	if cfg.StaleContainerAge == 0 {
+		cfg.StaleContainerAge = runtimecleanup.DefaultStaleContainerAge
+	}
 	if cfg.WorkspaceDir == "" {
 		cfg.WorkspaceDir = "workspace"
 	}
@@ -128,6 +139,11 @@ func NewSandboxEngine(cfg Config) (*SandboxEngine, error) {
 		return nil, xerr.Unavailable("docker daemon is unreachable; host fallback is disabled", err)
 	}
 	cancelProbe()
+	cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), dockerProbeTimeout)
+	if err := runtimecleanup.PruneStale(cleanupCtx, "docker", absWorkDir, cfg.StaleContainerAge); err != nil {
+		slog.Warn("docker: stale-container cleanup failed; continuing startup", "error", err)
+	}
+	cancelCleanup()
 
 	var b [4]byte
 
@@ -165,7 +181,8 @@ func NewSandboxEngine(cfg Config) (*SandboxEngine, error) {
 	ensureErr := engine.ensureWorkspaceContainer(context.Background(), defaultSession)
 	defaultSession.mu.Unlock()
 	if ensureErr != nil {
-		return nil, fmt.Errorf("failed starting sandbox container: %w", ensureErr)
+		closeErr := engine.Close()
+		return nil, errors.Join(fmt.Errorf("failed starting sandbox container: %w", ensureErr), closeErr)
 	}
 
 	return engine, nil
@@ -183,7 +200,22 @@ func (d *SandboxEngine) Name() string { return "docker-sandbox-engine" }
 
 func (d *SandboxEngine) Cache() *CacheManager { return d.cache }
 
+func (d *SandboxEngine) beginOperation() (func(), error) {
+	d.lifecycleMu.RLock()
+	if d.closed {
+		d.lifecycleMu.RUnlock()
+		return nil, xerr.Shutdown("docker sandbox engine is closed")
+	}
+	return d.lifecycleMu.RUnlock, nil
+}
+
 func (d *SandboxEngine) CommitToCache(ctx context.Context, tool, recipe string) error {
+	release, startErr := d.beginOperation()
+	if startErr != nil {
+		return startErr
+	}
+	defer release()
+
 	if d.cache == nil || !d.cache.Enabled() {
 		return nil
 	}
@@ -193,9 +225,8 @@ func (d *SandboxEngine) CommitToCache(ctx context.Context, tool, recipe string) 
 		return nil
 	}
 
-	_, err := d.cache.CommitAndSave(ctx, d.containerName, key, tool, recipe)
-
-	return err
+	_, commitErr := d.cache.CommitAndSave(ctx, d.containerName, key, tool, recipe)
+	return commitErr
 }
 
 func (d *SandboxEngine) resolveBaseImage(ctx context.Context) string {
@@ -258,6 +289,13 @@ func (d *SandboxEngine) getSession(sessionID string) *sandboxSession {
 }
 
 func (d *SandboxEngine) ensureWorkspaceContainer(ctx context.Context, session *sandboxSession) error {
+	if session.lease == nil {
+		lease, err := runtimecleanup.Acquire(session.containerName)
+		if err != nil {
+			return fmt.Errorf("acquire container lease %q: %w", session.containerName, err)
+		}
+		session.lease = lease
+	}
 	if err := os.MkdirAll(session.workspaceDir, 0o755); err != nil {
 		return fmt.Errorf("create session workspace: %w", err)
 	}
@@ -285,10 +323,17 @@ func (d *SandboxEngine) ensureWorkspaceContainer(ctx context.Context, session *s
 	}
 
 	baseImage := d.resolveBaseImage(ctx)
+	labels, err := runtimecleanup.LabelArgs(d.workspaceDir, session.containerName)
+	if err != nil {
+		return fmt.Errorf("prepare container ownership labels: %w", err)
+	}
 
 	runArgs := []string{
 		"run", "-d",
 		"--name", session.containerName,
+	}
+	runArgs = append(runArgs, labels...)
+	runArgs = append(runArgs,
 		"--memory", "2048m",
 		"--cpus", "2.0",
 		"--pids-limit", "512",
@@ -304,7 +349,7 @@ func (d *SandboxEngine) ensureWorkspaceContainer(ctx context.Context, session *s
 		"-w", "/workspace",
 		baseImage,
 		"tail", "-f", "/dev/null",
-	}
+	)
 
 	if out, err := exec.CommandContext(ctx, "docker", runArgs...).CombinedOutput(); err != nil {
 		return fmt.Errorf("docker run: %w: %s", err, string(out))
@@ -445,6 +490,12 @@ func (d *SandboxEngine) runStreaming(
 }
 
 func (d *SandboxEngine) ExecAdvanced(ctx context.Context, req ExecCommandReq) (sandbox.ExecutionResult, error) {
+	release, startErr := d.beginOperation()
+	if startErr != nil {
+		return sandbox.ExecutionResult{}, startErr
+	}
+	defer release()
+
 	session := d.getSession("")
 	session.mu.Lock()
 	defer session.mu.Unlock()
@@ -559,6 +610,12 @@ func (d *SandboxEngine) ExecAdvanced(ctx context.Context, req ExecCommandReq) (s
 }
 
 func (d *SandboxEngine) Run(ctx context.Context, sessionID string, profile sandbox.Profile, command sandbox.Command) (sandbox.ExecutionResult, error) {
+	release, startErr := d.beginOperation()
+	if startErr != nil {
+		return sandbox.ExecutionResult{}, startErr
+	}
+	defer release()
+
 	if len(command.Argv) == 0 {
 		return sandbox.ExecutionResult{ExitCode: 1, Stderr: "empty command"}, nil
 	}
@@ -663,6 +720,12 @@ func (d *SandboxEngine) applyResourceLimits(ctx context.Context, containerName s
 }
 
 func (d *SandboxEngine) InspectContainer(ctx context.Context) ContainerInspectInfo {
+	release, err := d.beginOperation()
+	if err != nil {
+		return ContainerInspectInfo{Name: d.containerName, Status: "Closed"}
+	}
+	defer release()
+
 	session := d.getSession("")
 	session.mu.Lock()
 	defer session.mu.Unlock()
@@ -713,6 +776,12 @@ func (d *SandboxEngine) Info() string {
 }
 
 func (d *SandboxEngine) WriteFile(_ context.Context, sessionID string, profile sandbox.Profile, relativePath string, content []byte) error {
+	release, startErr := d.beginOperation()
+	if startErr != nil {
+		return startErr
+	}
+	defer release()
+
 	profile.ApplyDefaults()
 	session := d.getSession(sessionID)
 	session.mu.Lock()
@@ -726,6 +795,12 @@ func (d *SandboxEngine) WriteFile(_ context.Context, sessionID string, profile s
 }
 
 func (d *SandboxEngine) ReadFile(_ context.Context, sessionID string, profile sandbox.Profile, relativePath string) ([]byte, error) {
+	release, startErr := d.beginOperation()
+	if startErr != nil {
+		return nil, startErr
+	}
+	defer release()
+
 	profile.ApplyDefaults()
 	session := d.getSession(sessionID)
 	session.mu.Lock()
@@ -741,6 +816,12 @@ func (d *SandboxEngine) ReadFile(_ context.Context, sessionID string, profile sa
 // Reset removes the selected session's container and workspace. For the default
 // session, Reset("") removes everything under the engine's base workspace directory.
 func (d *SandboxEngine) Reset(ctx context.Context, sessionID string) error {
+	release, startErr := d.beginOperation()
+	if startErr != nil {
+		return startErr
+	}
+	defer release()
+
 	session := d.getSession(sessionID)
 	session.mu.Lock()
 	defer session.mu.Unlock()
@@ -758,10 +839,20 @@ func (d *SandboxEngine) Reset(ctx context.Context, sessionID string) error {
 	return nil
 }
 
-// Close removes session containers while preserving their workspace files.
+// Close permanently shuts down the engine, removes session containers, and
+// preserves their workspace files. It is safe to call repeatedly.
 func (d *SandboxEngine) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	return d.CloseContext(ctx)
+}
+
+// CloseContext permanently shuts down the engine, removes session containers,
+// and preserves their workspace files. It is safe to call repeatedly.
+func (d *SandboxEngine) CloseContext(ctx context.Context) error {
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+	d.closed = true
 
 	d.mu.RLock()
 	sessions := make([]*sandboxSession, 0, len(d.sessions))
@@ -778,8 +869,15 @@ func (d *SandboxEngine) Close() error {
 			// #nosec G204 -- containerName is generated internally from an engine nonce and a session hash.
 			if err := exec.CommandContext(ctx, "docker", "rm", "-f", session.containerName).Run(); err != nil {
 				closeErr = errors.Join(closeErr, fmt.Errorf("remove container %q: %w", session.containerName, err))
+			} else {
+				session.containerCreated = false
 			}
-			session.containerCreated = false
+		}
+		if session.lease != nil {
+			if err := session.lease.Close(); err != nil {
+				closeErr = errors.Join(closeErr, fmt.Errorf("release container lease %q: %w", session.containerName, err))
+			}
+			session.lease = nil
 		}
 		session.mu.Unlock()
 	}

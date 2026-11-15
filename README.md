@@ -50,6 +50,12 @@ The repository depends on Nexss Flow and Nexss Kernel for its Flow bundle and ac
 | `inprocess` | Trusted local command execution | Runs programs on the host; profile resource limits do not isolate the process. |
 | `mock` | Unit tests and deterministic test fixtures | A pure-Go fake; it recognizes a small set of commands such as `ls`, `cat`, `go`, and `gofmt`. |
 
+### Container lifecycle
+
+In the Flow CLI, the runner host closes the bundle-owned engine after the outer invocation finishes. Other hosts must adopt the bundle and run its shutdown lifecycle for the same cleanup guarantee. Docker and Podman `Close` remove the engine's containers but preserve the mounted workspace; `Reset` remains the explicit destructive operation. If a process crashes before `Close`, the next engine startup checks only Sandbox-labeled containers for the same workspace, host, and user, and only when the runtime uses a local Unix socket or named pipe. TCP/HTTP(S) endpoints—including loopback, which may be a tunnel to a remote daemon—and unrecognized endpoints are not pruned automatically. A container is removed only after the configured age (24 hours by default) and after acquiring its OS-level lease; active containers, containers with uncertain ownership, and legacy unlabeled containers are left alone. The workspace is never removed by this fallback.
+
+Set `stale_container_age` in the Sandbox `@require` options to a Go duration such as `"48h"`; zero selects the 24-hour default, and negative values are rejected by the Docker and Podman engine configuration.
+
 ## Go API
 
 The common `sandbox.Engine` contract covers command execution, workspace file operations, and session lifecycle. `Profile.ApplyDefaults` supplies request limits and execution defaults; direct callers should explicitly validate requests with a policy before running them. For example:
@@ -118,6 +124,7 @@ The `as <alias>` form of `@require` is supported. This Docker example shows the 
   engine: "docker",
   workspace: ".sandbox",
   image: "golang:1.26-alpine",
+  stale_container_age: "24h",
   allowed_executables: "go, git, gofmt",
   allowed_env_keys: "GOCACHE, GOPROXY"
 }
