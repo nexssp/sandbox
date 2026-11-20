@@ -19,7 +19,7 @@ func TestDockerUnavailableIsRecoverableBeforeCommandRuns(t *testing.T) {
 	src := fmt.Sprintf(`@require github.com/nexssp/sandbox/nexssflow { engine: "docker", workspace: %q, enforce_policy: "false" }
 { command: "touch", args: [%q] } -> sandbox.exec
 ? on_error {
-xerr.KindUnavailable -> runtime.const @{ value: { recovered: true } },
+xerr.KindUnavailable -> { recovered: true },
   else -> error.reraise
 }
 `, workspace, marker)

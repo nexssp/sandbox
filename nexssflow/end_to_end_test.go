@@ -267,7 +267,7 @@ func main() {
 	src := fmt.Sprintf(`@require github.com/nexssp/sandbox/nexssflow as sb { engine: "inprocess", workspace: %q, enforce_policy: "false" }
 @embed logo "assets/logo.txt"
 
-sb.exec @{
+sb.exec(
   command: "go",
   args: ["run", %q, "static", "storage"],
   files: {
@@ -280,7 +280,7 @@ sb.exec @{
       ExpectedDigest: %q
     }
   }
-}
+)
 `, workspaceDir, readerPath, storageRef.Provider, storageRef.ID, storageRef.Version, storageRef.ExpectedSize, storageRef.ExpectedDigest)
 	cfg := buildConfig(t, src, embedBundle, storageBundle)
 	ctx := xctx.WithUserID(t.Context(), "e2e-caller")
