@@ -3,7 +3,7 @@ module github.com/nexssp/sandbox
 go 1.27.4
 
 require (
-	github.com/nexssp/flow v0.102.1
+	github.com/nexssp/flow v0.105.0
 	github.com/nexssp/kernel v1.0.0
 	github.com/nexssp/storage v0.5.0
 	golang.org/x/sys v0.50.0
